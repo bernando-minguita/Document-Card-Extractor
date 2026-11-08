@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+MANIFEST
+pip-wheel-metadata/
+
+# -------------------------------------------------------- virtual envs
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.python-version
+
+# ------------------------------------------------ tests and dev tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# --------------------------------------------------- application runtime
+# exported images, debug overlays and the user's own data never belong in git
+output/
+_debug/
+_check*/
+settings.json
+history.json
+*.log
+
+# scratch files and folders created while debugging
+_*.txt
+_*/
+
+# ------------------------------------------------------------ documents
+# Scanned PDFs can contain personal data (passports, ID cards, licences).
+# They are ignored so the repository can be published safely.
+# `python -m pytest` skips the sample-scan tests when the file is absent;
+# if you really want to publish a sanitised scan use: git add -f sample.pdf
+*.pdf
+!docs/**/*.pdf
+
+# ------------------------------------------------------------------- IDEs
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------- packaging
+*.spec

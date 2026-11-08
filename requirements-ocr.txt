@@ -1,0 +1,21 @@
+# Document Card Extractor - OPTIONAL OCR extras
+#
+# The application works completely without OCR (detection, cropping, export and
+# manual type selection). Installing one of these enables automatic
+# classification, document identifiers in the filename and 180° orientation
+# detection. See docs/OCR_SETUP.md for the step by step guide.
+#
+#   pip install -r requirements-ocr.txt
+#
+# ---------------------------------------------------------------------------
+# Tesseract (recommended: small, fast, ~1 s per card).
+# This pip package is only the wrapper - the Tesseract program itself must be
+# installed separately (and its language data, e.g. Arabic):
+#   https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract>=0.3.10
+
+# ---------------------------------------------------------------------------
+# EasyOCR (better accuracy, much slower on a CPU: 7-25 s per card).
+# It brings PyTorch (~200 MB download) and needs its model files, which the
+# application NEVER downloads by itself - see docs/OCR_SETUP.md step 3.
+easyocr>=1.7

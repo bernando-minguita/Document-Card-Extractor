@@ -1,0 +1,29 @@
+# Document Card Extractor - runtime requirements
+#
+# Install with:
+#   pip install -r requirements.txt
+
+# Desktop interface (Qt 6). "PySide6" also works and additionally ships the
+# tools that are not needed at runtime.
+PySide6-Essentials>=6.5
+
+# Image processing and document detection
+opencv-python-headless>=4.8        # opencv-python works as well
+numpy>=1.24
+
+# PDF rendering
+PyMuPDF>=1.24                      # imported as "pymupdf" (or "fitz" on older versions)
+
+# Image export
+Pillow>=10.0
+
+# ---------------------------------------------------------------------------
+# Optional: local OCR. The application works completely without OCR, but
+# document classification, identifier extraction and 180° orientation detection
+# are only available when one of these is installed.
+#
+# Tesseract (needs the Tesseract binary: https://github.com/UB-Mannheim/tesseract/wiki)
+# pytesseract>=0.3.10
+#
+# EasyOCR (pure Python, downloads model files once; afterwards fully offline)
+# easyocr>=1.7
