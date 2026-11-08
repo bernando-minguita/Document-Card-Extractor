@@ -202,7 +202,7 @@ QSlider::handle:horizontal {{
     background: {PRIMARY};
 }}
 
-/* ------------------------------------------------------------- containers */
+/* ------------------------------------------------------------ containers */
 QFrame#Card {{
     background: {SURFACE};
     border: 1px solid {BORDER};
@@ -312,7 +312,7 @@ QHeaderView::section {{
     font-weight: 700;
 }}
 
-/* ------------------------------------------------------------- graphics view */
+/* ------------------------------------------------------------------ graphics view */
 QGraphicsView {{
     background: {SURFACE_ALT};
     border: 1px solid {BORDER};
@@ -412,4 +412,3 @@ QTabBar::tab:selected {{
     border-bottom: 2px solid {PRIMARY};
 }}
 """
-

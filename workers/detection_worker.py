@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 from PySide6.QtCore import QThread, Signal
 
 from core.card_detector import CardDetector, DetectionConfig, candidate_to_card
+from core.barcode_reader import BarcodeReader, refine_identifier
 from core.document_classifier import DocumentClassifier
 from core.image_preprocessor import resize_max_dim
 from core.models import DetectedCard
@@ -80,6 +81,8 @@ class DetectionWorker(QThread):
         try:
             detector = CardDetector(DetectionConfig.from_settings(settings))
             orientation = OrientationDetector()
+            # QR/barcode reader for identifiers (optional, no OCR needed).
+            barcode_reader = BarcodeReader()
             ocr_engine = OcrEngine(
                 languages=(getattr(settings, "ocr_languages", "en") or "en").split(","),
                 prefer=getattr(settings, "ocr_engine", "auto"),
@@ -110,7 +113,7 @@ class DetectionWorker(QThread):
                             return
                         card = candidate_to_card(candidate, width, height, page_index, self._padding())
                         card, read = self._finish_card(
-                            card, working, orientation, ocr_engine, classifier
+                            card, working, orientation, ocr_engine, classifier, barcode_reader
                         )
                         if read:
                             ocr_cards += 1
@@ -157,6 +160,7 @@ class DetectionWorker(QThread):
         orientation: OrientationDetector,
         ocr_engine: Optional[OcrEngine],
         classifier: Optional[DocumentClassifier],
+        barcode_reader: Optional["BarcodeReader"],
     ):
         """Warp the card, fix its orientation and (optionally) classify it.
 
@@ -214,6 +218,12 @@ class DetectionWorker(QThread):
                     card.notes = result.reason
             except Exception as exc:
                 card.notes = f"Classification skipped: {exc}"
+
+        if not self._cancel_requested and barcode_reader is not None and barcode_reader.is_available:
+            # A QR/barcode on the card carries the authoritative ID number and
+            # needs no OCR; it overrides a plain OCR regex hit (more reliable)
+            # and fills the identifier when classification is off entirely.
+            refine_identifier(card, upright, barcode_reader)
 
         card.thumbnail = make_thumbnail(upright, int(getattr(settings, "thumbnail_size", 420)))
         return card, read_by_ocr

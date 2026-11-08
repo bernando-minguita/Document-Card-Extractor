@@ -49,7 +49,7 @@ from core.ocr_engine import OcrEngine
 from core.pdf_loader import PdfDocument, PdfError, is_supported_file, supported_file_filter
 from core.perspective_corrector import make_thumbnail, rotate_image, warp_quad
 from widgets.crop_editor import CropEditorDialog
-from widgets.document_gallery import DocumentGallery
+from widgets.document_gallery import DocumentGallery, GalleryFilter
 from widgets.pdf_viewer import OverlaySpec, PdfPageView
 from widgets.progress_widget import ProgressPanel
 from widgets.qt_image import bgr_to_qimage
@@ -337,6 +337,13 @@ class MainWindow(QMainWindow):
         page_bar.addWidget(self._btn_next)
         page_bar.addSpacing(16)
 
+        # Page range for detection (optional, empty = all pages)
+        self._page_range_edit = QLineEdit()
+        self._page_range_edit.setPlaceholderText("Pages (e.g. 1,3,5-7)")
+        self._page_range_edit.setFixedWidth(160)
+        self._page_range_edit.setToolTip("Pages to run detection on. Format: 1,3,5-7 (empty = all pages)")
+        page_bar.addWidget(self._page_range_edit)
+
         self._btn_zoom_out = QToolButton()
         self._btn_zoom_out.setObjectName("IconButton")
         self._btn_zoom_out.setIcon(icon("zoom_out"))
@@ -427,6 +434,32 @@ class MainWindow(QMainWindow):
         self._gallery_filter.currentIndexChanged.connect(lambda _index: self._refresh_gallery())
         header.addWidget(self._gallery_filter)
         layout.addLayout(header)
+
+        # Filter bar
+        filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(6)
+        self._gallery_search = QLineEdit()
+        self._gallery_search.setPlaceholderText("Search (type, identifier, OCR text, page…)")
+        self._gallery_search.setClearButtonEnabled(True)
+        self._gallery_search.textChanged.connect(lambda _t: self._refresh_gallery())
+        self._gallery_type_filter = QComboBox()
+        self._gallery_type_filter.addItem("All types", None)
+        self._gallery_type_filter.setMinimumWidth(160)
+        self._gallery_type_filter.currentIndexChanged.connect(lambda _i: self._refresh_gallery())
+        self._gallery_page_filter = QComboBox()
+        self._gallery_page_filter.addItem("All pages", None)
+        self._gallery_page_filter.setMinimumWidth(100)
+        self._gallery_page_filter.currentIndexChanged.connect(lambda _i: self._refresh_gallery())
+        self._gallery_included_only = QCheckBox("Included only")
+        self._gallery_included_only.toggled.connect(lambda _c: self._refresh_gallery())
+        self._gallery_confident_only = QCheckBox("Orientation OK only")
+        self._gallery_confident_only.toggled.connect(lambda _c: self._refresh_gallery())
+        filter_bar.addWidget(self._gallery_search, 1)
+        filter_bar.addWidget(self._gallery_type_filter)
+        filter_bar.addWidget(self._gallery_page_filter)
+        filter_bar.addWidget(self._gallery_included_only)
+        filter_bar.addWidget(self._gallery_confident_only)
+        layout.addLayout(filter_bar)
 
         self._gallery = DocumentGallery()
         self._gallery.cardSelected.connect(self._on_card_selected)
@@ -827,6 +860,16 @@ class MainWindow(QMainWindow):
         self._page_spin.setValue(1)
         self._page_spin.blockSignals(False)
         self._page_total_label.setText(f"of {session.page_count if session else 0}")
+
+        # Update gallery page filter
+        self._gallery_page_filter.blockSignals(True)
+        self._gallery_page_filter.clear()
+        self._gallery_page_filter.addItem("All pages", None)
+        if session:
+            for p in range(session.page_count):
+                self._gallery_page_filter.addItem(f"Page {p+1:02d}", p)
+        self._gallery_page_filter.blockSignals(False)
+
         self._show_current_page()
         self._refresh_gallery()
         self._update_state()
@@ -882,10 +925,8 @@ class MainWindow(QMainWindow):
         session = self.session
         if session is None:
             return []
-        if self._gallery_filter.currentData() == "all":
-            cards = list(session.cards)
-        else:
-            cards = session.cards_for_page(self._page_index)
+        # Return all cards; the gallery will filter based on its filter settings
+        cards = list(session.cards)
         return sorted(
             cards,
             key=lambda card: (card.page_index, float(card.quad_norm[:, 1].mean()), float(card.quad_norm[:, 0].mean())),
@@ -918,8 +959,31 @@ class MainWindow(QMainWindow):
         cards = self._visible_cards()
         if self._selected_card_id and all(card.card_id != self._selected_card_id for card in cards):
             self._selected_card_id = ""
-        self._gallery.set_cards(cards, self._selected_card_id)
-        self._gallery_count.setText(f"({len(cards)})")
+
+        # Build gallery filter from UI controls
+        from core.models import DocumentType
+
+        type_filter = None
+        type_data = self._gallery_type_filter.currentData()
+        if type_data is not None:
+            type_filter = DocumentType.from_value(type_data)
+
+        page_filter = None
+        page_data = self._gallery_page_filter.currentData()
+        if page_data is not None:
+            page_filter = int(page_data)
+
+        gallery_filter = GalleryFilter(
+            text=self._gallery_search.text(),
+            doc_type=type_filter,
+            page=page_filter,
+            included_only=self._gallery_included_only.isChecked(),
+            orientation_confident_only=self._gallery_confident_only.isChecked(),
+        )
+        self._gallery.set_filter(gallery_filter, self._selected_card_id)
+        self._gallery.set_cards(self._visible_cards(), self._selected_card_id)
+
+        self._gallery_count.setText(f"({self._gallery.count()})")
         self._sync_card_controls()
 
     def _sync_card_controls(self) -> None:
@@ -961,6 +1025,14 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self._type_combo.setCurrentIndex(index)
         self._type_combo.blockSignals(False)
+
+        # Also populate the gallery type filter
+        self._gallery_type_filter.blockSignals(True)
+        self._gallery_type_filter.clear()
+        self._gallery_type_filter.addItem("All types", None)
+        for doc_type in DocumentType.choices():
+            self._gallery_type_filter.addItem(doc_type.display_name, doc_type.value)
+        self._gallery_type_filter.blockSignals(False)
 
     @staticmethod
     def _type_color(doc_type: DocumentType) -> str:
@@ -1033,7 +1105,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No document", "Open a PDF or image first.")
             return
         if pages is None:
-            pages = list(range(session.page_count))
+            # A page range typed in the page bar ("1,3,5-7") narrows the run.
+            range_text = self._page_range_edit.text().strip()
+            if range_text:
+                pages = self._parse_page_range(range_text, session.page_count)
+            else:
+                pages = list(range(session.page_count))
         pages = [page for page in pages if 0 <= page < session.page_count]
         if not pages:
             return
@@ -1082,6 +1159,30 @@ class MainWindow(QMainWindow):
         session = self.session
         if session is not None:
             session.add_card(card)
+
+    def _parse_page_range(self, text: str, page_count: int) -> List[int]:
+        """Parse ``"1,3,5-7"`` into zero-based page indices."""
+        result: List[int] = []
+        for chunk in text.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "-" in chunk:
+                start, _, end = chunk.partition("-")
+                try:
+                    first = max(1, int(start))
+                    last = min(page_count, int(end))
+                except ValueError:
+                    continue
+                result.extend(range(first - 1, last))
+            else:
+                try:
+                    page = int(chunk)
+                except ValueError:
+                    continue
+                if 1 <= page <= page_count:
+                    result.append(page - 1)
+        return sorted(set(result))
 
     def _on_page_finished(self, page_index: int, count: int) -> None:
         session = self.session

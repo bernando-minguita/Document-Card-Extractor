@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QUndoStack, QUndoCommand
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -33,6 +35,34 @@ from widgets.pdf_viewer import OverlaySpec, PdfPageView
 from widgets.qt_image import FitImageLabel, bgr_to_pixmap, bgr_to_qimage
 
 
+@dataclass
+class _CardState:
+    """Snapshot of editable card properties for undo/redo."""
+    quad_norm: np.ndarray
+    rotation: int
+    fine_rotation: float
+    doc_type: DocumentType
+    identifier: str
+    included: bool
+    orientation_confident: bool
+
+
+class _CardEditCommand(QUndoCommand):
+    """Undoable command for card property changes."""
+
+    def __init__(self, editor: "CropEditorDialog", old_state: _CardState, new_state: _CardState, text: str):
+        super().__init__(text)
+        self._editor = editor
+        self._old_state = old_state
+        self._new_state = new_state
+
+    def undo(self) -> None:
+        self._editor._apply_state(self._old_state)
+
+    def redo(self) -> None:
+        self._editor._apply_state(self._new_state)
+
+
 class CropEditorDialog(QDialog):
     """Modal editor for a single detected card."""
 
@@ -56,6 +86,9 @@ class CropEditorDialog(QDialog):
         self._page_image: Optional[np.ndarray] = None
         self._load_error = ""
         self._rotate_base = 0.0
+        # Undo/redo stack
+        self._undo_stack = QUndoStack(self)
+        self._suppress_undo = False
         # Rendering the cropped preview is expensive (full-page perspective
         # warp + a 1000 px thumbnail).  During a live rotation drag or while
         # nudging with the arrow keys it fires per mouse-move, so rebuilds are
@@ -82,6 +115,59 @@ class CropEditorDialog(QDialog):
         finally:
             if document is not None:
                 document.close()
+
+    # ------------------------------------------------------------------ undo/redo
+    def _current_state(self) -> _CardState:
+        return _CardState(
+            quad_norm=self._draft.quad_norm.copy(),
+            rotation=self._draft.rotation,
+            fine_rotation=self._draft.fine_rotation,
+            doc_type=self._draft.doc_type,
+            identifier=self._draft.identifier,
+            included=self._draft.included,
+            orientation_confident=self._draft.orientation_confident,
+        )
+
+    def _apply_state(self, state: _CardState) -> None:
+        """Apply a card state without pushing to undo stack."""
+        self._suppress_undo = True
+        try:
+            self._draft.quad_norm = state.quad_norm.copy()
+            self._draft.rotation = state.rotation
+            self._draft.fine_rotation = state.fine_rotation
+            self._draft.doc_type = state.doc_type
+            self._draft.identifier = state.identifier
+            self._draft.included = state.included
+            self._draft.orientation_confident = state.orientation_confident
+            self._refresh()
+        finally:
+            self._suppress_undo = False
+
+    def _push_state(self, text: str, old_state: _CardState) -> None:
+        """Push a new state to the undo stack."""
+        if self._suppress_undo:
+            return
+        new_state = self._current_state()
+        if self._states_differ(old_state, new_state):
+            self._undo_stack.push(_CardEditCommand(self, old_state, new_state, text))
+
+    @staticmethod
+    def _states_differ(a: _CardState, b: _CardState) -> bool:
+        if not np.allclose(a.quad_norm, b.quad_norm):
+            return True
+        if a.rotation != b.rotation:
+            return True
+        if abs(a.fine_rotation - b.fine_rotation) > 1e-6:
+            return True
+        if a.doc_type != b.doc_type:
+            return True
+        if a.identifier != b.identifier:
+            return True
+        if a.included != b.included:
+            return True
+        if a.orientation_confident != b.orientation_confident:
+            return True
+        return False
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -204,6 +290,25 @@ class CropEditorDialog(QDialog):
             )
             step_row.addWidget(button)
             self._size_buttons[key] = button
+        step_row.addStretch(1)
+
+        # Undo/Redo
+        self._undo_button = QToolButton()
+        self._undo_button.setText("\u21a9")
+        self._undo_button.setToolTip("Undo (Ctrl+Z)")
+        self._undo_button.clicked.connect(self._undo_stack.undo)
+        self._undo_stack.canUndoChanged.connect(self._undo_button.setEnabled)
+        self._undo_button.setEnabled(False)
+        step_row.addWidget(self._undo_button)
+
+        self._redo_button = QToolButton()
+        self._redo_button.setText("\u21aa")
+        self._redo_button.setToolTip("Redo (Ctrl+Y)")
+        self._redo_button.clicked.connect(self._undo_stack.redo)
+        self._undo_stack.canRedoChanged.connect(self._redo_button.setEnabled)
+        self._redo_button.setEnabled(False)
+        step_row.addWidget(self._redo_button)
+
         side_layout.addLayout(step_row)
 
         margin_row = QHBoxLayout()
@@ -314,8 +419,11 @@ class CropEditorDialog(QDialog):
         self._fine_spin.blockSignals(False)
         self._ocr_text_view.setPlainText(self._draft.ocr_text or "")
         self._copy_ocr_button.setEnabled(bool((self._draft.ocr_text or "").strip()))
+        # Preserve cursor position in identifier edit
+        cursor_pos = self._identifier_edit.cursorPosition()
         self._identifier_edit.blockSignals(True)
         self._identifier_edit.setText(self._draft.identifier)
+        self._identifier_edit.setCursorPosition(min(cursor_pos, len(self._draft.identifier)))
         self._identifier_edit.blockSignals(False)
         self._include_check.blockSignals(True)
         self._include_check.setChecked(self._draft.included)
@@ -368,6 +476,7 @@ class CropEditorDialog(QDialog):
     def _on_quad_edited(self, card_id: str, quad_norm) -> None:
         if card_id != self._draft.card_id:
             return
+        old = self._current_state()
         # the view reports the displayed (already deskewed) quad -> bake it
         self._draft.quad_norm = np.asarray(quad_norm, dtype=np.float32).reshape(4, 2)
         self._draft.fine_rotation = 0.0
@@ -375,11 +484,19 @@ class CropEditorDialog(QDialog):
         self._fine_spin.setValue(0.0)
         self._fine_spin.blockSignals(False)
         self._schedule_preview()
+        self._push_state("Edit crop", old)
 
     def _on_fine_rotation_changed(self, value: float) -> None:
+        if self._suppress_undo:
+            self._draft.fine_rotation = float(value)
+            self._view.set_overlays(self._overlays(), self._draft.card_id)
+            self._schedule_preview()
+            return
+        old = self._current_state()
         self._draft.fine_rotation = float(value)
         self._view.set_overlays(self._overlays(), self._draft.card_id)
         self._schedule_preview()
+        self._push_state("Fine rotation", old)
 
     def _on_rotate_started(self, card_id: str) -> None:
         if card_id != self._draft.card_id:
@@ -415,14 +532,18 @@ class CropEditorDialog(QDialog):
 
     def _expand_margin(self) -> None:
         """Grow the crop on all four sides by the margin spin box (in mm)."""
+        old = self._current_state()
         millimetres = float(self._margin_spin.value())
         pixels = millimetres * float(self.PREVIEW_DPI) / 25.4
         self._view.resize_selected(pixels, pixels)
+        self._push_state("Add margin", old)
 
     def _rotate(self, degrees: int) -> None:
+        old = self._current_state()
         self._draft.rotation = (self._draft.rotation + int(degrees)) % 360
         self._draft.orientation_confident = True
         self._update_preview()
+        self._push_state(f"Rotate {degrees}°", old)
 
     def _on_type_changed(self, index: int) -> None:
         if index < 0:
@@ -434,13 +555,25 @@ class CropEditorDialog(QDialog):
         # be converted back instead of being type-checked.
         doc_type = DocumentType.from_value(raw)
         if doc_type is not self._draft.doc_type:
+            old = self._current_state()
             self._draft.set_type(doc_type, 1.0)
+            self._push_state("Change type", old)
 
     def _on_identifier_changed(self, text: str) -> None:
+        if self._suppress_undo:
+            self._draft.identifier = text.strip()
+            return
+        old = self._current_state()
         self._draft.identifier = text.strip()
+        self._push_state("Edit identifier", old)
 
     def _on_include_toggled(self, checked: bool) -> None:
+        if self._suppress_undo:
+            self._draft.included = bool(checked)
+            return
+        old = self._current_state()
         self._draft.included = bool(checked)
+        self._push_state("Toggle include", old)
 
     def _reset(self) -> None:
         self._draft = self._reset_source.copy_card()

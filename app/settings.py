@@ -122,11 +122,16 @@ class AppSettings:
     create_subfolder_per_pdf: bool = True
     filename_template: str = "{type}_{identifier}_{page}_{sequence}"
     open_output_after_export: bool = True
+    blur_faces: bool = False
+    face_blur_kernel: int = 51
+    min_face_size: int = 40
 
     # --------------------------------------------------------------------- misc
     thumbnail_size: int = 420
     last_input_dir: str = ""
     recent_files: List[str] = field(default_factory=list)
+    # Export presets: [{"name": ..., "options": {...}}]
+    export_presets: List[Dict[str, Any]] = field(default_factory=list)
     # User defined document types: [{"token": ..., "label": ..., "keywords": "a, b"}]
     custom_document_types: List[Dict[str, Any]] = field(default_factory=list)
     # Extra OCR keywords per type token (works for built-in types too)
@@ -302,7 +307,59 @@ class AppSettings:
             render_dpi=self.render_dpi,
             filename_template=self.filename_template,
             create_subfolder=self.create_subfolder_per_pdf,
+            blur_faces=self.blur_faces,
+            face_blur_kernel=self.face_blur_kernel,
+            min_face_size=self.min_face_size,
         )
+
+    # ----------------------------------------------------------- export presets
+    def export_preset_names(self) -> List[str]:
+        return [p.get("name", "") for p in self.export_presets if p.get("name")]
+
+    def get_export_preset(self, name: str) -> Optional[ExportOptions]:
+        for p in self.export_presets:
+            if p.get("name") == name:
+                opts = p.get("options", {})
+                return ExportOptions(
+                    output_dir=opts.get("output_dir", self.output_dir or str(DEFAULT_OUTPUT_DIR)),
+                    image_format=opts.get("image_format", self.export_format),
+                    jpeg_quality=opts.get("jpeg_quality", self.jpeg_quality),
+                    render_dpi=opts.get("render_dpi", self.render_dpi),
+                    filename_template=opts.get("filename_template", self.filename_template),
+                    create_subfolder=opts.get("create_subfolder", self.create_subfolder_per_pdf),
+                    blur_faces=opts.get("blur_faces", self.blur_faces),
+                    face_blur_kernel=opts.get("face_blur_kernel", self.face_blur_kernel),
+                    min_face_size=opts.get("min_face_size", self.min_face_size),
+                )
+        return None
+
+    def save_export_preset(self, name: str) -> bool:
+        name = name.strip()
+        if not name:
+            return False
+        # render_dpi is deliberately NOT stored: the same setting also drives
+        # *detection* ("Export / detection DPI"), so applying an export preset
+        # must not silently change detection behaviour.  Presets describe the
+        # output only (format, quality, folder, template, face blur).
+        opts_dict = {
+            "output_dir": self.output_dir or str(DEFAULT_OUTPUT_DIR),
+            "image_format": self.export_format,
+            "jpeg_quality": self.jpeg_quality,
+            "filename_template": self.filename_template,
+            "create_subfolder": self.create_subfolder_per_pdf,
+            "blur_faces": self.blur_faces,
+            "face_blur_kernel": self.face_blur_kernel,
+            "min_face_size": self.min_face_size,
+        }
+        # Remove existing with same name
+        self.export_presets = [p for p in self.export_presets if p.get("name") != name]
+        self.export_presets.append({"name": name, "options": opts_dict})
+        return True
+
+    def delete_export_preset(self, name: str) -> bool:
+        before = len(self.export_presets)
+        self.export_presets = [p for p in self.export_presets if p.get("name") != name]
+        return len(self.export_presets) != before
 
     def remember_file(self, path: str) -> None:
         self.last_input_dir = str(Path(path).parent)

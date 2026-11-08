@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -25,6 +26,47 @@ SUPPORTED_FORMATS = {
 _ILLEGAL_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+# ------------------------------------------------------------------ face blur
+_FACE_CASCADE = None
+
+
+def _get_face_cascade():
+    """Load OpenCV's built-in Haar cascade for frontal faces."""
+    global _FACE_CASCADE
+    if _FACE_CASCADE is None:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
+        if _FACE_CASCADE.empty():
+            raise RuntimeError(f"Failed to load face cascade from {cascade_path}")
+    return _FACE_CASCADE
+
+
+def blur_faces(image: np.ndarray, blur_kernel: int = 51, min_face_size: int = 40) -> np.ndarray:
+    """Detect and blur faces in *image* (BGR). Returns a copy with faces blurred."""
+    if image is None or image.size == 0:
+        return image
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    cascade = _get_face_cascade()
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(min_face_size, min_face_size),
+        flags=cv2.CASCADE_SCALE_IMAGE,
+    )
+    if len(faces) == 0:
+        return image
+    result = image.copy()
+    k = max(3, blur_kernel | 1)  # ensure odd
+    for (x, y, w, h) in faces:
+        roi = result[y:y+h, x:x+w]
+        if roi.size == 0:
+            continue
+        blurred = cv2.GaussianBlur(roi, (k, k), 0)
+        result[y:y+h, x:x+w] = blurred
+    return result
+
+
 @dataclass
 class ExportOptions:
     """User selectable export settings."""
@@ -38,6 +80,9 @@ class ExportOptions:
     overwrite_existing: bool = False
     apply_rotation: bool = True
     padding_ratio: float = 0.0  # cards already carry their own padding
+    blur_faces: bool = False
+    face_blur_kernel: int = 51
+    min_face_size: int = 40
 
     def extension(self) -> str:
         return SUPPORTED_FORMATS.get(self.image_format.lower().strip("."), ".jpg")
@@ -216,6 +261,14 @@ class ImageExporter:
                 image = extract_card_image(document, card, self.options.render_dpi, self.options.padding_ratio)
                 if self.options.apply_rotation and card.rotation:
                     image = rotate_image(image, card.rotation)
+                if self.options.blur_faces:
+                    # min_face_size is tuned for the 300 dpi baseline - scale
+                    # it with the actual render resolution, otherwise a
+                    # sub-300 dpi export hunts face boxes that are larger than
+                    # the whole (small) image.
+                    dpi = document.effective_dpi(card.page_index, self.options.render_dpi)
+                    min_face = max(16, int(round(self.options.min_face_size * dpi / 300.0)))
+                    image = blur_faces(image, self.options.face_blur_kernel, min_face)
                 stem = self.build_filename(card, sequence, document.stem, identifier_fallback)
                 path = self.unique_path(output_dir, stem, used)
                 self.save_image(image, path, self.options.render_dpi)

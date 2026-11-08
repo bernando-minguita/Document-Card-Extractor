@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
@@ -23,6 +24,37 @@ from widgets.qt_image import bgr_to_pixmap
 
 ITEM_SIZE = QSize(238, 250)
 THUMB_HEIGHT = 140
+
+
+@dataclass
+class GalleryFilter:
+    """Filter criteria for the gallery."""
+    text: str = ""
+    doc_type: Optional[DocumentType] = None
+    page: Optional[int] = None
+    included_only: bool = False
+    orientation_confident_only: bool = False
+
+    def matches(self, card: DetectedCard) -> bool:
+        if self.text:
+            t = self.text.lower()
+            hay = " ".join([
+                card.doc_type.display_name.lower(),
+                card.identifier.lower() if card.identifier else "",
+                f"page {card.page_number}",
+                card.ocr_text.lower() if card.ocr_text else "",
+            ])
+            if t not in hay:
+                return False
+        if self.doc_type and card.doc_type != self.doc_type:
+            return False
+        if self.page is not None and card.page_number != self.page:
+            return False
+        if self.included_only and not card.included:
+            return False
+        if self.orientation_confident_only and not card.orientation_confident:
+            return False
+        return True
 
 
 class CardItemDelegate(QStyledItemDelegate):
@@ -176,6 +208,8 @@ class DocumentGallery(QListWidget):
         super().__init__(parent)
         self._delegate = CardItemDelegate(self)
         self._cards: Dict[str, DetectedCard] = {}
+        self._all_cards: List[DetectedCard] = []
+        self._filter = GalleryFilter()
         self.setObjectName("DocumentGallery")
         self.setItemDelegate(self._delegate)
         self.setViewMode(QListWidget.ViewMode.IconMode)
@@ -194,11 +228,18 @@ class DocumentGallery(QListWidget):
     # ------------------------------------------------------------------- content
     def set_cards(self, cards: List[DetectedCard], selected_id: str = "") -> None:
         """Rebuild the gallery from *cards*."""
+        self._all_cards = list(cards)
+        self._apply_filter(selected_id)
+
+    def _apply_filter(self, selected_id: str = "") -> None:
+        """Rebuild visible items from _all_cards using current filter."""
         self.blockSignals(True)
         self.clear()
         self._cards.clear()
         self._delegate.invalidate()
-        for card in cards:
+        for card in self._all_cards:
+            if not self._filter.matches(card):
+                continue
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, card)
             item.setSizeHint(ITEM_SIZE)
@@ -214,15 +255,38 @@ class DocumentGallery(QListWidget):
             if item is not None:
                 self.scrollToItem(item)
 
+    def set_filter(self, filter_: GalleryFilter, selected_id: str = "") -> None:
+        """Update the filter and rebuild visible items."""
+        self._filter = filter_
+        self._apply_filter(selected_id)
+
+    def filter(self) -> GalleryFilter:
+        return self._filter
+
     def update_card(self, card: DetectedCard) -> None:
         """Refresh a single card (used after a rotation or type change)."""
-        item = self.item_for(card.card_id)
-        self._cards[card.card_id] = card
-        self._delegate.invalidate(card.card_id)
-        if item is not None:
-            item.setData(Qt.ItemDataRole.UserRole, card)
-            item.setToolTip(self._tooltip(card))
-        self.viewport().update()
+        # Update in _all_cards
+        for i, c in enumerate(self._all_cards):
+            if c.card_id == card.card_id:
+                self._all_cards[i] = card
+                break
+        # Update in visible if it passes filter
+        if self._filter.matches(card):
+            item = self.item_for(card.card_id)
+            self._cards[card.card_id] = card
+            self._delegate.invalidate(card.card_id)
+            if item is not None:
+                item.setData(Qt.ItemDataRole.UserRole, card)
+                item.setToolTip(self._tooltip(card))
+            self.viewport().update()
+        else:
+            # Card no longer matches filter - remove from visible
+            item = self.item_for(card.card_id)
+            if item is not None:
+                row = self.row(item)
+                self.takeItem(row)
+                self._cards.pop(card.card_id, None)
+                self._delegate.invalidate(card.card_id)
 
     def item_for(self, card_id: str) -> Optional[QListWidgetItem]:
         for row in range(self.count()):

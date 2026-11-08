@@ -37,7 +37,7 @@ def main() -> int:
     try:
         from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QFont
-        from PySide6.QtWidgets import QApplication, QMessageBox
+        from PySide6.QtWidgets import QApplication
     except ImportError as exc:  # pragma: no cover - depends on the environment
         print(_friendly_import_error(exc), file=sys.stderr)
         return 1

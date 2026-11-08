@@ -96,6 +96,12 @@ class SettingsPage(QWidget):
         "_set_open_folder",
         "_set_template",
         "_template_preview",
+        "_set_blur_faces",
+        "_set_blur_kernel",
+        "_set_min_face",
+        "_preset_combo",
+        "_btn_save_preset",
+        "_btn_delete_preset",
         "_type_grid_host",
         "_type_grid",
     )
@@ -103,6 +109,7 @@ class SettingsPage(QWidget):
     def __init__(self, main_window: "QMainWindow", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._mw = main_window
+        self._suppress_preset_sync = False
         self._build_settings_page()
 
     # ------------------------------------------------------------ construction
@@ -304,6 +311,44 @@ class SettingsPage(QWidget):
         export_form.addWidget(QLabel("Filename format"), 5, 0)
         export_form.addWidget(self._set_template, 5, 1)
         export_form.addWidget(self._template_preview, 6, 1)
+
+        self._set_blur_faces = QCheckBox("Blur faces in exported images")
+        self._set_blur_faces.setToolTip("Detect and blur faces using OpenCV's Haar cascade (privacy redaction)")
+        self._set_blur_kernel = QSpinBox()
+        self._set_blur_kernel.setRange(3, 201)
+        self._set_blur_kernel.setSingleStep(2)
+        self._set_blur_kernel.setSuffix(" px")
+        self._set_blur_kernel.setToolTip("Gaussian blur kernel size (odd number, larger = more blur)")
+        self._set_min_face = QSpinBox()
+        self._set_min_face.setRange(20, 200)
+        self._set_min_face.setSuffix(" px")
+        self._set_min_face.setToolTip(
+            "Minimum face size to detect at the 300 dpi baseline "
+            "(scaled with the render DPI for other resolutions; smaller = more sensitive)"
+        )
+        export_form.addWidget(self._set_blur_faces, 7, 0, 1, 2)
+        export_form.addWidget(QLabel("Blur kernel"), 8, 0)
+        export_form.addWidget(self._set_blur_kernel, 8, 1)
+        export_form.addWidget(QLabel("Min face size"), 9, 0)
+        export_form.addWidget(self._set_min_face, 9, 1)
+
+        # Export presets
+        self._preset_combo = QComboBox()
+        self._preset_combo.setMinimumWidth(200)
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset"))
+        preset_row.addWidget(self._preset_combo, 1)
+        self._btn_save_preset = QPushButton(icon("save"), " Save")
+        self._btn_save_preset.setToolTip("Save current export settings as a preset")
+        self._btn_save_preset.clicked.connect(self._save_preset)
+        self._btn_delete_preset = QPushButton(icon("trash"), " Delete")
+        self._btn_delete_preset.setToolTip("Delete the selected preset")
+        self._btn_delete_preset.clicked.connect(self._delete_preset)
+        self._btn_delete_preset.setEnabled(False)
+        preset_row.addWidget(self._btn_save_preset)
+        preset_row.addWidget(self._btn_delete_preset)
+        export_form.addLayout(preset_row, 10, 0, 1, 2)
         form_layout.addWidget(export_group)
 
         # --------------------------------------------------------- document types
@@ -375,13 +420,70 @@ class SettingsPage(QWidget):
         self._set_quality.setValue(int(settings.jpeg_quality))
         self._set_output_dir.setText(settings.output_dir)
         self._set_subfolder.setChecked(bool(settings.create_subfolder_per_pdf))
-        self._set_open_folder.setChecked(bool(settings.open_output_after_export))
-        self._set_template.setText(settings.filename_template)
+        self._set_blur_faces.setChecked(bool(settings.blur_faces))
+        self._set_blur_kernel.setValue(int(settings.face_blur_kernel))
+        self._set_min_face.setValue(int(settings.min_face_size))
+        self._refresh_presets()
         self._update_filename_preview()
         self._refresh_type_list()
         self._mw._normalise_region_preset()
         self._mw._sync_region_controls()
         self._refresh_ocr_hint()
+
+    def _refresh_presets(self) -> None:
+        """Rebuild the preset combo from settings."""
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.clear()
+        self._preset_combo.addItem("— Current settings —", None)
+        for name in self._mw.settings.export_preset_names():
+            self._preset_combo.addItem(name, name)
+        self._preset_combo.blockSignals(False)
+        self._btn_delete_preset.setEnabled(False)
+
+    def _on_preset_selected(self, index: int) -> None:
+        name = self._preset_combo.currentData()
+        self._btn_delete_preset.setEnabled(name is not None)
+        if name is None:
+            return
+        opts = self._mw.settings.get_export_preset(name)
+        if opts is None:
+            return
+        self._suppress_preset_sync = True
+        try:
+            self._set_format.setCurrentIndex(self._set_format.findData(opts.image_format))
+            self._set_quality.setValue(opts.jpeg_quality)
+            self._set_output_dir.setText(opts.output_dir)
+            self._set_subfolder.setChecked(opts.create_subfolder)
+            self._set_template.setText(opts.filename_template)
+            self._set_blur_faces.setChecked(opts.blur_faces)
+            self._set_blur_kernel.setValue(opts.face_blur_kernel)
+            self._set_min_face.setValue(opts.min_face_size)
+            # render_dpi is not applied: the setting also drives *detection*
+            # DPI, and an export preset must not silently change that.  It stays
+            # a global rendering option (see AppSettings.save_export_preset).
+        finally:
+            self._suppress_preset_sync = False
+
+    def _save_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save export preset", "Preset name:")
+        if not ok or not name.strip():
+            return
+        if self._mw.settings.save_export_preset(name.strip()):
+            self._refresh_presets()
+            idx = self._preset_combo.findData(name.strip())
+            if idx >= 0:
+                self._preset_combo.setCurrentIndex(idx)
+            self._mw._progress.set_message(f"Export preset '{name.strip()}' saved")
+
+    def _delete_preset(self) -> None:
+        name = self._preset_combo.currentData()
+        if not name:
+            return
+        if QMessageBox.question(self, "Delete preset", f"Delete export preset '{name}'?") != QMessageBox.StandardButton.Yes:
+            return
+        if self._mw.settings.delete_export_preset(name):
+            self._refresh_presets()
+            self._mw._progress.set_message(f"Export preset '{name}' deleted")
 
     def _check_ocr_engines(self) -> None:
         """Test the configured engine(s) and show the diagnostic report."""
@@ -463,6 +565,9 @@ class SettingsPage(QWidget):
         settings.create_subfolder_per_pdf = bool(self._set_subfolder.isChecked())
         settings.open_output_after_export = bool(self._set_open_folder.isChecked())
         settings.filename_template = self._set_template.text().strip() or "{type}_{identifier}_{page}_{sequence}"
+        settings.blur_faces = bool(self._set_blur_faces.isChecked())
+        settings.face_blur_kernel = int(self._set_blur_kernel.value())
+        settings.min_face_size = int(self._set_min_face.value())
         if not settings.save():
             QMessageBox.warning(
                 self,

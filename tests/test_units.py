@@ -923,3 +923,50 @@ def test_effective_dpi_never_upscales_beyond_native():
     native["dpi"] = 72
     assert document.effective_dpi(0, 800, cap_to_native=False) == 800
 
+
+def test_refine_identifier_uses_barcode_values():
+    """QR/barcode contents override OCR regex identifiers when they look like IDs."""
+    from core.barcode_reader import BarcodeReadout, BarcodeResult, refine_identifier
+
+    class _FakeReader:
+        def __init__(self, best=""):
+            self.is_available = True
+            self._best = best
+
+        def read(self, image):
+            results = []
+            if self._best:
+                results.append(
+                    BarcodeResult(data=self._best, type="QRCODE", rect=(0, 0, 10, 10), polygon=[])
+                )
+            return BarcodeReadout(barcodes=results, best_identifier=self._best)
+
+    card = DetectedCard(page_index=0, quad_norm=_quad(0.1, 0.1, 0.6, 0.6))
+    card.set_type(DocumentType.IQAMA, 0.5)
+    image = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    # No OCR identifier -> the QR fills the gap.
+    reader = _FakeReader("2567251562")
+    assert refine_identifier(card, image, reader) is True
+    assert card.identifier == "2567251562"
+
+    # A weak OCR identifier is replaced by the authoritative QR value.
+    card.identifier = "12"
+    assert refine_identifier(card, image, _FakeReader("2567251562")) is True
+    assert card.identifier == "2567251562"
+
+    # Text that is not an ID pattern is ignored - the OCR value survives.
+    card.identifier = "GOOD123456"
+    assert refine_identifier(card, image, _FakeReader("WELCOME")) is False
+    assert card.identifier == "GOOD123456"
+
+    # An unavailable reader must not touch the identifier.
+    offline = _FakeReader("2567251562")
+    offline.is_available = False
+    assert refine_identifier(card, image, offline) is False
+    assert card.identifier == "GOOD123456"
+
+    # A successful QR read overrides a plain OCR regex hit (more reliable).
+    assert refine_identifier(card, image, _FakeReader("2567251562")) is True
+    assert card.identifier == "2567251562"
+

@@ -19,3 +19,13 @@ pytesseract>=0.3.10
 # It brings PyTorch (~200 MB download) and needs its model files, which the
 # application NEVER downloads by itself - see docs/OCR_SETUP.md step 3.
 easyocr>=1.7
+
+# ---------------------------------------------------------------------------
+# QR / barcode decoding (optional, for identifiers from 2D codes on IDs).
+# pyzbar requires the zbar shared library (brew install zbar / apt install libzbar0).
+pyzbar>=0.1.9
+
+# ---------------------------------------------------------------------------
+# Face detection/blur (optional, for privacy redaction).
+# Uses OpenCV's built-in Haar cascades (no extra deps beyond opencv-python-headless).
+# opencv-python-headless>=4.8  # already in requirements.txt

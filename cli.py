@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 
 from core.card_detector import CardDetector, DetectionConfig, candidate_to_card
+from core.barcode_reader import BarcodeReader, refine_identifier
 from core.document_classifier import DocumentClassifier
 from core.image_exporter import ExportOptions, ImageExporter, suggest_output_dir
 from core.image_preprocessor import resize_max_dim
@@ -102,6 +103,7 @@ def process_document(path: Path, args) -> int:
     orientation = OrientationDetector()
     ocr_engine = OcrEngine(tuple(args.ocr_languages.split(","))) if args.ocr else None
     classifier = DocumentClassifier(ocr_engine=ocr_engine) if not args.no_classify else None
+    barcode_reader = BarcodeReader()
     exporter = ImageExporter(
         ExportOptions(
             output_dir=args.output,
@@ -163,6 +165,7 @@ def process_document(path: Path, args) -> int:
                 card.set_type(classification.doc_type, classification.confidence)
                 card.identifier = classification.identifier
                 card.ocr_text = text
+            refine_identifier(card, upright, barcode_reader)
             card.thumbnail = make_thumbnail(upright, 400)
             cards.append(card)
             check = "" if card.orientation_confident else "  (verify rotation)"
