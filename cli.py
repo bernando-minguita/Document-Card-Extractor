@@ -38,29 +38,20 @@ from core.image_exporter import ExportOptions, ImageExporter, suggest_output_dir
 from core.image_preprocessor import resize_max_dim
 from core.ocr_engine import OcrEngine
 from core.orientation_detector import OrientationDetector
+from core.page_range import parse_page_range
 from core.pdf_loader import PdfDocument, PdfError
 from core.perspective_corrector import make_thumbnail, rotate_image, warp_quad
 
 
 def parse_pages(text: str, page_count: int) -> List[int]:
-    """Parse ``"1,3,5-7"`` into zero based page indices."""
-    if not text:
-        return list(range(page_count))
-    result: List[int] = []
-    for chunk in text.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if "-" in chunk:
-            start, _, end = chunk.partition("-")
-            first = max(1, int(start))
-            last = min(page_count, int(end))
-            result.extend(range(first - 1, last))
-        else:
-            page = int(chunk)
-            if 1 <= page <= page_count:
-                result.append(page - 1)
-    return sorted(set(result))
+    """Parse ``"1,3,5-7"`` into zero based page indices.
+
+    Malformed parts are reported by :func:`main` through
+    :func:`core.page_range.parse_page_range` before any file is opened; here they
+    are simply skipped so a bad chunk can never abort an extraction.
+    """
+    return parse_page_range(text, page_count)[0]
+
 
 
 def draw_debug(image: np.ndarray, cards, path: Path) -> None:
@@ -231,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", "-o", default="output", help="output folder (default: output)")
     parser.add_argument("--pages", default="", help='pages to process, e.g. "1,3,5-7" (default: all)')
-    parser.add_argument("--format", "-f", default="jpg", choices=["jpg", "jpeg", "png", "tiff"],
+    parser.add_argument("--format", "-f", default="jpg", choices=["jpg", "jpeg", "png", "tif", "tiff"],
                         help="image format (default: jpg)")
     parser.add_argument("--quality", type=int, default=95, help="JPEG quality 60-100 (default: 95)")
     parser.add_argument("--dpi", type=int, default=300, help="render resolution (default: 300)")
@@ -262,6 +253,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return check_ocr(languages)
     if not args.pdfs:
         build_parser().error("at least one PDF is required (or use --check-ocr)")
+    if str(args.pages or "").strip():
+        # Validate the page range before touching a file: a typo must produce a
+        # usage message, not a ValueError traceback half way through a batch.
+        _indices, rejected = parse_page_range(args.pages)
+        if rejected:
+            build_parser().error(
+                "invalid --pages value(s): "
+                + ", ".join(rejected)
+                + '  (expected page numbers or ranges such as "1,3,5-7")'
+            )
     total = 0
     for pdf in args.pdfs:
         path = Path(pdf)

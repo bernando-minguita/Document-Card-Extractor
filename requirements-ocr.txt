@@ -26,6 +26,6 @@ easyocr>=1.7
 pyzbar>=0.1.9
 
 # ---------------------------------------------------------------------------
-# Face detection/blur (optional, for privacy redaction).
-# Uses OpenCV's built-in Haar cascades (no extra deps beyond opencv-python-headless).
-# opencv-python-headless>=4.8  # already in requirements.txt
+# Face blur for privacy redaction needs NO extra package: it uses OpenCV's Haar
+# cascade on OpenCV 4 and the YuNet model that ships in assets/models on
+# OpenCV 5. See the note in requirements.txt.

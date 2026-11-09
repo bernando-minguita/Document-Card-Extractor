@@ -42,6 +42,12 @@ def settings_path() -> Path:
     return _config_folder() / SETTINGS_FILENAME
 
 
+def data_folder() -> Path:
+    """Per-user folder for the settings, the history and optional model files."""
+    return _config_folder()
+
+
+
 def _write_json_atomic(path: Path, data: Any) -> bool:
     """Write *data* to *path* without ever leaving a truncated JSON file.
 
@@ -183,12 +189,13 @@ class AppSettings:
 
     def save(self) -> bool:
         """Write the settings atomically; ``False`` (instead of a crash or a
-        silently swallowed error) when the file could not be written."""
-        path = settings_path()
-        try:
-            return _write_json_atomic(path, self.to_dict())
-        except Exception:
-            return False
+        silently swallowed error) when the file could not be written.
+
+        ``_write_json_atomic`` already catches every failure and reports it as
+        ``False``, so there is nothing left for this wrapper to guard.
+        """
+        return _write_json_atomic(settings_path(), self.to_dict())
+
 
     # ---------------------------------------------------------- document types
     def apply_document_types(self) -> None:

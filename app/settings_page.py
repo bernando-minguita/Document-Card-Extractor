@@ -99,6 +99,8 @@ class SettingsPage(QWidget):
         "_set_blur_faces",
         "_set_blur_kernel",
         "_set_min_face",
+        "_blur_status",
+        "_btn_download_model",
         "_preset_combo",
         "_btn_save_preset",
         "_btn_delete_preset",
@@ -332,6 +334,22 @@ class SettingsPage(QWidget):
         export_form.addWidget(QLabel("Min face size"), 9, 0)
         export_form.addWidget(self._set_min_face, 9, 1)
 
+        # Face blur engine state: which detector is used, or how to enable one.
+        blur_row = QHBoxLayout()
+        blur_row.setSpacing(8)
+        self._blur_status = QLabel("")
+        self._blur_status.setObjectName("Faint")
+        self._blur_status.setWordWrap(True)
+        self._btn_download_model = QPushButton(icon("export"), " Download model…")
+        self._btn_download_model.setToolTip(
+            "Download the small YuNet face model once (about 230 KB); afterwards "
+            "face blur works completely offline"
+        )
+        self._btn_download_model.clicked.connect(self._download_face_model)
+        blur_row.addWidget(self._blur_status, 1)
+        blur_row.addWidget(self._btn_download_model)
+        export_form.addLayout(blur_row, 10, 0, 1, 2)
+
         # Export presets
         self._preset_combo = QComboBox()
         self._preset_combo.setMinimumWidth(200)
@@ -348,8 +366,9 @@ class SettingsPage(QWidget):
         self._btn_delete_preset.setEnabled(False)
         preset_row.addWidget(self._btn_save_preset)
         preset_row.addWidget(self._btn_delete_preset)
-        export_form.addLayout(preset_row, 10, 0, 1, 2)
+        export_form.addLayout(preset_row, 11, 0, 1, 2)
         form_layout.addWidget(export_group)
+
 
         # --------------------------------------------------------- document types
         types_group = QGroupBox("Document types")
@@ -420,6 +439,8 @@ class SettingsPage(QWidget):
         self._set_quality.setValue(int(settings.jpeg_quality))
         self._set_output_dir.setText(settings.output_dir)
         self._set_subfolder.setChecked(bool(settings.create_subfolder_per_pdf))
+        self._set_open_folder.setChecked(bool(settings.open_output_after_export))
+        self._set_template.setText(settings.filename_template)
         self._set_blur_faces.setChecked(bool(settings.blur_faces))
         self._set_blur_kernel.setValue(int(settings.face_blur_kernel))
         self._set_min_face.setValue(int(settings.min_face_size))
@@ -429,6 +450,7 @@ class SettingsPage(QWidget):
         self._mw._normalise_region_preset()
         self._mw._sync_region_controls()
         self._refresh_ocr_hint()
+        self._refresh_face_blur_state()
 
     def _refresh_presets(self) -> None:
         """Rebuild the preset combo from settings."""
@@ -473,7 +495,7 @@ class SettingsPage(QWidget):
             idx = self._preset_combo.findData(name.strip())
             if idx >= 0:
                 self._preset_combo.setCurrentIndex(idx)
-            self._mw._progress.set_message(f"Export preset '{name.strip()}' saved")
+            self._store_presets(f"Export preset '{name.strip()}' saved")
 
     def _delete_preset(self) -> None:
         name = self._preset_combo.currentData()
@@ -483,7 +505,28 @@ class SettingsPage(QWidget):
             return
         if self._mw.settings.delete_export_preset(name):
             self._refresh_presets()
-            self._mw._progress.set_message(f"Export preset '{name}' deleted")
+            self._store_presets(f"Export preset '{name}' deleted")
+
+    def _store_presets(self, message: str) -> None:
+        """Write the preset list to disk right away.
+
+        The preset buttons are a complete action on their own - without this the
+        new preset (or the deletion) vanished on the next start unless the user
+        also pressed "Save settings".
+        """
+        settings = self._mw.settings
+        if settings.save():
+            self._mw._progress.set_message(message)
+            return
+        QMessageBox.warning(
+            self,
+            "Presets not saved",
+            "The preset list could not be written to:\n\n"
+            f"{settings_path()}\n\n"
+            "It stays active for this session, but it will not survive a restart.",
+        )
+        self._mw._progress.set_message("Export presets could not be saved")
+
 
     def _check_ocr_engines(self) -> None:
         """Test the configured engine(s) and show the diagnostic report."""
@@ -508,10 +551,65 @@ class SettingsPage(QWidget):
             "OCR engine is ready" if usable else "No usable OCR engine found"
         )
         self._refresh_ocr_hint()
+        # the sidebar line was computed at startup - keep it in sync with a check
+        self._mw._update_ocr_status_label()
         if usable:
             QMessageBox.information(self, "OCR check", report)
         else:
             QMessageBox.warning(self, "OCR check", report)
+
+    def _refresh_face_blur_state(self) -> None:
+        """Show which face detector is used (and offer the model download).
+
+        The detector is the YuNet neural network on OpenCV 5 (which dropped the
+        Haar cascade) and the Haar cascade on OpenCV 4; when neither can run, the
+        export skips the blur and says so instead of failing.
+        """
+        from core import face_detector
+
+        available = face_detector.is_available()
+        _backend, message = face_detector.status()
+        download = face_detector.can_download_model()
+        for widget in (self._set_blur_faces, self._set_blur_kernel, self._set_min_face):
+            widget.setEnabled(available)
+        self._btn_download_model.setVisible(download)
+        if available:
+            self._blur_status.setText(f"Face blur engine: {message}")
+            self._set_blur_faces.setToolTip(
+                "Detect and blur faces in the exported images (privacy redaction)"
+            )
+        else:
+            self._blur_status.setText(f"Face blur unavailable — {message}")
+            self._set_blur_faces.setToolTip(f"Unavailable — {message}")
+
+    def _download_face_model(self) -> None:
+        """Fetch the YuNet model once (the only network access in the app)."""
+        from core import face_detector
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._mw._progress.set_message("Downloading the face model…")
+        try:
+            path = face_detector.download_model()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Face model",
+                f"The face model could not be downloaded:\n\n{exc}\n\n"
+                "You can also copy the file manually:\n"
+                f"{face_detector.MODEL_FILENAME}\n\ninto:\n"
+                f"{face_detector.model_folder()}",
+            )
+            self._mw._progress.set_message("Face model download failed")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_face_blur_state()
+        self._mw._progress.set_message("Face model installed — face blur is ready")
+        QMessageBox.information(
+            self,
+            "Face model installed",
+            "Face blur is ready.\n\nThe model was saved to:\n\n" f"{path}",
+        )
 
     def _refresh_ocr_hint(self) -> None:
         """Update the small hint line under the OCR settings."""
@@ -616,6 +714,20 @@ class SettingsPage(QWidget):
         width = self._type_grid_host.width()
         return 1 if 0 < width < 620 else 2
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Re-flow the type tiles when the window becomes narrow/wide.
+
+        The grid is built while the page is still hidden (width 0), so the column
+        count has to be re-evaluated once the real width is known - and again
+        whenever the user resizes the window.
+        """
+        super().resizeEvent(event)
+        if not hasattr(self, "_type_grid"):
+            return
+        if self._type_grid_columns() != getattr(self, "_type_grid_columns_used", 2):
+            self._refresh_type_list()
+
+
     def _clear_type_grid(self) -> None:
         while self._type_grid.count():
             item = self._type_grid.takeAt(0)
@@ -647,6 +759,7 @@ class SettingsPage(QWidget):
 
         self._clear_type_grid()
         columns = self._type_grid_columns()
+        self._type_grid_columns_used = columns
         for index, doc_type in enumerate(DocumentType.all_choices()):
             user_words = list(doc_type.user_keywords)
             known_words = builtin_keywords(doc_type) if doc_type.is_known else []

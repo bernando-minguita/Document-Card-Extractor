@@ -960,6 +960,367 @@ def test_arrow_keys_nudge_and_resize_the_crop(window, sample_pdf):
     dialog.accept()
 
 
+# --------------------------------------------------------------- review fixes
+def _two_page_pdf(tmp_path) -> Path:
+    """A generated 2 page PDF (no sample.pdf needed)."""
+    try:
+        import pymupdf as _fitz
+    except ImportError:  # pragma: no cover - older PyMuPDF releases
+        import fitz as _fitz
+
+    path = tmp_path / "two_pages.pdf"
+    document = _fitz.open()
+    for _ in range(2):
+        page = document.new_page(width=500, height=350)
+        page.draw_rect(_fitz.Rect(40, 40, 280, 200), color=(0, 0, 0), fill=(0.2, 0.3, 0.6))
+    document.save(str(path))
+    document.close()
+    return path
+
+
+def _study_cards(window, pages: int):
+    """Give the loaded session one synthetic card per page (no detection run)."""
+    from core.models import DetectedCard
+
+    session = window.session
+    assert session is not None
+    cards = []
+    for page_index in range(pages):
+        card = DetectedCard(
+            page_index=page_index,
+            quad_norm=np.array(
+                [[0.1, 0.1], [0.6, 0.1], [0.6, 0.5], [0.1, 0.5]], dtype=np.float32
+            ),
+            confidence=0.9,
+            page_size=(500, 350),
+        )
+        session.add_card(card)
+        cards.append(card)
+    session.detected_pages.update(range(pages))
+    window._refresh_gallery()
+    return cards
+
+
+def test_gallery_page_filter_shows_the_page_it_names(window, tmp_path):
+    """Regression: the combo stored 0-based pages, page_number is 1-based."""
+    from PySide6.QtCore import Qt
+
+    window.load_pdf(str(_two_page_pdf(tmp_path)))
+    cards = _study_cards(window, 2)
+
+    combo = window._gallery_page_filter
+    assert combo.itemData(1) == 1, "Page 01 must filter on page_number 1"
+    assert combo.itemData(2) == 2
+
+    # "This page" (the default) follows the viewer; switch to "All pages" so the
+    # page combo is in charge.
+    window._gallery_filter.setCurrentIndex(1)
+    flush_events(2)
+
+    combo.setCurrentIndex(1)  # Page 01
+    flush_events(2)
+    shown = [
+        window._gallery.item(row).data(Qt.ItemDataRole.UserRole)
+        for row in range(window._gallery.count())
+    ]
+    assert [card.page_number for card in shown] == [1]
+    assert shown[0].card_id == cards[0].card_id
+
+    combo.setCurrentIndex(2)  # Page 02
+    flush_events(2)
+    shown = [
+        window._gallery.item(row).data(Qt.ItemDataRole.UserRole)
+        for row in range(window._gallery.count())
+    ]
+    assert [card.page_number for card in shown] == [2]
+    assert shown[0].card_id == cards[1].card_id
+
+
+def test_gallery_page_combo_follows_the_viewer(window, tmp_path):
+    """The "This page / All pages" combo was connected but never read."""
+    from PySide6.QtCore import Qt
+
+    window.load_pdf(str(_two_page_pdf(tmp_path)))
+    _study_cards(window, 2)
+
+    window._gallery_filter.setCurrentIndex(0)  # This page
+    window.select_page(0)
+    flush_events(2)
+    assert window._gallery.count() == 1
+    assert not window._gallery_page_filter.isEnabled()
+
+    window.select_page(1)
+    flush_events(2)
+    card = window._gallery.item(0).data(Qt.ItemDataRole.UserRole)
+    assert card.page_number == 2
+
+    window._gallery_filter.setCurrentIndex(1)  # All pages
+    flush_events(2)
+    assert window._gallery.count() == 2
+    assert window._gallery_page_filter.isEnabled()
+
+
+def test_export_card_writes_an_excluded_card(window, sample_pdf, tmp_path, monkeypatch):
+    """Regression: "Export it anyway?" exported nothing at all."""
+    from PySide6.QtWidgets import QFileDialog
+
+    session = _detect(window, sample_pdf)
+    card = session.cards[0]
+    card.included = False
+
+    target = tmp_path / "single"
+    target.mkdir()
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(target))
+    )
+
+    window.export_card(card.card_id)
+    assert pump_until(lambda: not window._busy)
+    flush_events(3)
+
+    assert list(target.glob("*")), "the confirmed export did not write a file"
+    assert window.history.entries and window.history.entries[0].document_count == 1
+
+
+def test_excluded_card_can_be_exported_by_the_job(window, sample_pdf):
+    """The worker/exporter filter included cards; the snapshot must carry the flag."""
+    from workers.export_worker import ExportJob
+
+    session = _detect(window, sample_pdf)
+    card = session.cards[0]
+    card.included = False
+
+    snapshot = card.copy_card()
+    snapshot.included = True
+    job = ExportJob(session.path, [snapshot])
+    assert [item.card_id for item in job.included_cards] == [card.card_id]
+
+
+def test_settings_form_round_trips_every_control(window, monkeypatch, tmp_path):
+    """Regression: "Open the output folder…" was never loaded from the settings.
+
+    A control that is not filled in shows its widget default and then *writes*
+    that default back on "Save settings", silently changing the configuration.
+    """
+    settings = AppSettings()
+    settings.render_dpi = 350
+    settings.cap_dpi_to_native = False
+    settings.preview_dpi = 111
+    settings.detection_sensitivity = 9
+    settings.min_document_area = 0.012
+    settings.max_document_area = 0.8
+    settings.detection_min_confidence = 0.5
+    settings.refine_quads = False
+    settings.detection_working_max_dim = 1800
+    settings.manual_region_fixed_size = True
+    settings.manual_region_preset = "id_card"
+    settings.manual_region_width_mm = 85.6
+    settings.manual_region_height_mm = 53.98
+    settings.auto_orientation = False
+    settings.auto_classify = False
+    settings.ocr_enabled = True
+    settings.ocr_for_orientation = True
+    settings.ocr_engine = "tesseract"
+    settings.ocr_languages = "en,ar"
+    settings.export_format = "png"
+    settings.jpeg_quality = 88
+    settings.output_dir = str(tmp_path / "out")
+    settings.create_subfolder_per_pdf = False
+    settings.open_output_after_export = True
+    settings.filename_template = "{type}-{page}"
+    settings.blur_faces = True
+    settings.face_blur_kernel = 41
+    settings.min_face_size = 60
+    monkeypatch.setattr(settings, "save", lambda: True)
+
+    window.settings = settings
+    window._switch_page(3)
+    window._settings_page._load_settings_into_form()
+
+    assert window._set_open_folder.isChecked(), "the checkbox was not loaded"
+    window._settings_page._save_settings_from_form()
+
+    saved = window.settings
+    assert saved.render_dpi == 350
+    assert saved.cap_dpi_to_native is False
+    assert saved.preview_dpi == 111
+    assert saved.detection_sensitivity == 9
+    assert saved.detection_min_confidence == pytest.approx(0.5)
+    assert saved.refine_quads is False
+    assert saved.detection_working_max_dim == 1800
+    assert saved.manual_region_preset == "id_card"
+    assert saved.auto_orientation is False
+    assert saved.auto_classify is False
+    assert saved.ocr_enabled is True
+    assert saved.ocr_for_orientation is True
+    assert saved.ocr_engine == "tesseract"
+    assert saved.ocr_languages == "en,ar"
+    assert saved.export_format == "png"
+    assert saved.jpeg_quality == 88
+    assert saved.create_subfolder_per_pdf is False
+    assert saved.open_output_after_export is True, "the save cleared it"
+    assert saved.filename_template == "{type}-{page}"
+    assert saved.blur_faces is True
+    assert saved.face_blur_kernel == 41
+    assert saved.min_face_size == 60
+
+
+def test_saving_an_export_preset_writes_the_settings_file(window, monkeypatch, tmp_path):
+    """Regression: presets were kept in memory only (lost on restart)."""
+    from app import settings as settings_module
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_module, "settings_path", lambda: settings_file)
+    monkeypatch.setattr(
+        "PySide6.QtWidgets.QInputDialog.getText",
+        staticmethod(lambda *a, **k: ("Scans", True)),
+    )
+    # the window fixture stubs save() out so tests never touch the real profile;
+    # this test is about that write, so restore the real one
+    window.settings.__dict__.pop("save", None)
+
+    window.settings.export_format = "png"
+    window._switch_page(3)
+    window._settings_page._save_preset()
+
+    assert settings_file.exists(), "saving a preset did not write settings.json"
+    reloaded = settings_module.AppSettings.load()
+    assert reloaded.export_preset_names() == ["Scans"]
+    assert reloaded.get_export_preset("Scans").image_format == "png"
+
+    window._preset_combo.setCurrentIndex(window._preset_combo.findData("Scans"))
+    window._settings_page._delete_preset()
+    assert settings_module.AppSettings.load().export_preset_names() == []
+
+
+def test_crop_editor_undo_shortcuts_and_dpi_hint(window, sample_pdf):
+    """Regression: the tooltips promised Ctrl+Z / Ctrl+Y but nothing was bound."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeySequence
+    from PySide6.QtTest import QTest
+
+    from widgets.crop_editor import CropEditorDialog
+
+    session = _detect(window, sample_pdf)
+    card = session.cards[0]
+
+    dialog = CropEditorDialog(sample_pdf, card, window, render_dpi=250)
+    dialog.show()
+    # the shortcuts are window-scoped, so the dialog must own the keyboard
+    dialog.activateWindow()
+    dialog.setFocus()
+    flush_events(3)
+
+    assert dialog._undo_shortcut.key() == QKeySequence(QKeySequence.StandardKey.Undo)
+    assert dialog._redo_shortcut.key() == QKeySequence(QKeySequence.StandardKey.Redo)
+    # the size estimate follows the configured DPI instead of a hard coded 300
+    assert "at 250 dpi" in dialog._preview_info.text()
+
+    before = dialog.card.quad_norm.copy()
+    dialog._view.resize_selected(8.0, 8.0)
+    flush_events(2)
+    assert dialog._undo_stack.canUndo()
+
+    QTest.keyClick(dialog, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    flush_events(2)
+    assert np.allclose(dialog.card.quad_norm, before), "Ctrl+Z did not undo"
+    assert dialog._undo_stack.canRedo()
+
+    QTest.keyClick(dialog, Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier)
+    flush_events(2)
+    assert not np.allclose(dialog.card.quad_norm, before), "Ctrl+Y did not redo"
+    dialog.close()
+
+
+def test_identifier_edit_is_a_single_undo_step(window, sample_pdf):
+    """Regression: one undo command per keystroke; Reset kept the stack."""
+    from widgets.crop_editor import CropEditorDialog
+
+    session = _detect(window, sample_pdf)
+    card = session.cards[0]
+    original = card.identifier
+
+    dialog = CropEditorDialog(sample_pdf, card, window)
+    flush_events(2)
+
+    for text in ("A", "AB", "AB1", "AB12"):
+        dialog._identifier_edit.setText(text)  # one textChanged per keystroke
+    assert not dialog._undo_stack.canUndo(), "typing must not push a command per key"
+
+    dialog._identifier_edit.editingFinished.emit()  # the user left the field
+    assert dialog._undo_stack.count() == 1
+    dialog._undo_stack.undo()
+    assert dialog.card.identifier == original
+
+    # Reset starts over: earlier edits are no longer undoable
+    dialog._identifier_edit.setText("ZZ99")
+    dialog._identifier_edit.editingFinished.emit()
+    assert dialog._undo_stack.canUndo()
+    dialog._reset()
+    assert not dialog._undo_stack.canUndo()
+    assert dialog.card.identifier == original
+    dialog.close()
+
+
+def test_hiding_a_card_does_not_change_the_gallery_selection(window, tmp_path):
+    """Regression: takeItem() moved the current row behind the user's back."""
+    window.load_pdf(str(_two_page_pdf(tmp_path)))
+    cards = _study_cards(window, 2)
+
+    cards[1].included = False
+    window._gallery_included_only.setChecked(True)
+    flush_events(2)
+    assert window._gallery.count() == 1
+
+    window._gallery.select_card(cards[0].card_id)
+    flush_events(2)
+    announced = []
+    window._gallery.cardSelected.connect(announced.append)
+
+    cards[0].included = False  # now it no longer matches the filter
+    window._gallery.update_card(cards[0])
+    flush_events(2)
+
+    assert window._gallery.count() == 0
+    assert announced == [], "removing a card emitted a selection change"
+
+
+def test_face_blur_settings_reflect_the_detector_backend(window, monkeypatch):
+    """The settings must show which detector runs, or offer the model download."""
+    from core import face_detector
+
+    monkeypatch.setattr(face_detector, "_status_cache", None)
+    monkeypatch.setattr(face_detector, "model_candidates", lambda: [])
+    window._switch_page(3)
+    window._settings_page._refresh_face_blur_state()
+
+    if face_detector.can_download_model():
+        # YuNet is compiled in but its model is missing: offer the download
+        assert window._btn_download_model.isVisibleTo(window._settings_page)
+        assert "unavailable" in window._blur_status.text().lower()
+        assert not window._set_blur_faces.isEnabled()
+    else:
+        assert window._btn_download_model.isVisibleTo(window._settings_page) is False
+
+    # a model file turns the option on and names the backend
+    monkeypatch.setattr(
+        face_detector,
+        "status",
+        lambda: ("yunet", "YuNet neural network (model.onnx)"),
+    )
+    monkeypatch.setattr(face_detector, "can_download_model", lambda: False)
+    window._settings_page._refresh_face_blur_state()
+    assert window._set_blur_faces.isEnabled()
+    assert window._set_blur_kernel.isEnabled()
+    assert "YuNet" in window._blur_status.text()
+    assert not window._btn_download_model.isVisibleTo(window._settings_page)
+
+    monkeypatch.setattr(face_detector, "status", lambda: ("", "no detector here"))
+    window._settings_page._refresh_face_blur_state()
+    assert not window._set_blur_faces.isEnabled()
+    assert "no detector here" in window._blur_status.text()
+
+
 def test_crop_editor_nudge_and_size_buttons(window, sample_pdf):
     from PySide6.QtWidgets import QApplication
 

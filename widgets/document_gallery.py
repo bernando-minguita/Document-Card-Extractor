@@ -76,6 +76,19 @@ class CardItemDelegate(QStyledItemDelegate):
             self._pixmaps.pop(card_id, None)
             self._scaled = {key: value for key, value in self._scaled.items() if key[0] != card_id}
 
+    def prune(self, keep_ids: set) -> None:
+        """Drop the cached pixmaps of cards that are gone, keep the rest.
+
+        Filtering the gallery rebuilds its items on every keystroke; clearing the
+        whole cache there would re-convert and re-scale every thumbnail that is
+        still visible.  A card's pixmap only changes when ``invalidate(card_id)``
+        is called for it, so pruning is enough.
+        """
+        for card_id in [key for key in self._pixmaps if key not in keep_ids]:
+            self._pixmaps.pop(card_id, None)
+        self._scaled = {key: value for key, value in self._scaled.items() if key[0] in keep_ids}
+
+
     def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt naming
         return ITEM_SIZE
 
@@ -226,9 +239,20 @@ class DocumentGallery(QListWidget):
         self.itemDoubleClicked.connect(self._on_item_activated)
 
     # ------------------------------------------------------------------- content
-    def set_cards(self, cards: List[DetectedCard], selected_id: str = "") -> None:
-        """Rebuild the gallery from *cards*."""
+    def set_cards(
+        self,
+        cards: List[DetectedCard],
+        selected_id: str = "",
+        filter_: Optional[GalleryFilter] = None,
+    ) -> None:
+        """Rebuild the gallery from *cards* (optionally replacing the filter).
+
+        Passing the filter here is the single-refresh path: ``set_filter()`` +
+        ``set_cards()`` would rebuild the list twice per call.
+        """
         self._all_cards = list(cards)
+        if filter_ is not None:
+            self._filter = filter_
         self._apply_filter(selected_id)
 
     def _apply_filter(self, selected_id: str = "") -> None:
@@ -236,7 +260,10 @@ class DocumentGallery(QListWidget):
         self.blockSignals(True)
         self.clear()
         self._cards.clear()
-        self._delegate.invalidate()
+        # Only the pixmaps of cards that are really gone are dropped, so a
+        # filter change (every keystroke in the search box) does not re-scale
+        # every visible thumbnail.
+        self._delegate.prune({card.card_id for card in self._all_cards})
         for card in self._all_cards:
             if not self._filter.matches(card):
                 continue
@@ -284,9 +311,17 @@ class DocumentGallery(QListWidget):
             item = self.item_for(card.card_id)
             if item is not None:
                 row = self.row(item)
-                self.takeItem(row)
+                # takeItem() moves the current row, which would emit
+                # itemSelectionChanged and let the main window re-select a
+                # different card behind the user's back.
+                self.blockSignals(True)
+                try:
+                    self.takeItem(row)
+                finally:
+                    self.blockSignals(False)
                 self._cards.pop(card.card_id, None)
                 self._delegate.invalidate(card.card_id)
+
 
     def item_for(self, card_id: str) -> Optional[QListWidgetItem]:
         for row in range(self.count()):

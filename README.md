@@ -48,6 +48,13 @@ python main.py
 Alternatively double-click `run.bat`, which starts `main.py` with the Python on
 your `PATH`.
 
+> **Face blur (privacy):** works with OpenCV 4 (Haar cascade) and OpenCV 5
+> (YuNet neural network). OpenCV 5 removed the cascade API, so on OpenCV 5 the
+> app uses the YuNet model that ships in `assets/models/` (≈230 KB). If that file
+> is missing, press **Settings → Export → Download model…** once; afterwards it
+> runs fully offline. Without any model the export still runs — it just reports
+> that blurring was skipped.
+
 ### 2.2 Optional local OCR
 
 Everything works without OCR — detection, cropping, export and manual type
@@ -111,7 +118,8 @@ The sidebar shows which OCR engine was detected.
 | `python cli.py --check-ocr` | Report which local OCR engine/models are ready |
 | `python cli.py scan.pdf --pages 1,3 --format png --dpi 400 --debug-dir _debug` | Selected pages, PNG, debug overlays |
 | `python cli.py scan.pdf --ocr` | Batch extraction with OCR classification |
-| `python -m pytest tests -q` | Run the automated test suite |
+| `python cli.py scan.pdf --format tif` | JPEG / PNG / TIF(F) output |
+| `python -m pytest tests -q` | Run the automated test suite (135 tests, about 2 min) |
 
 `cli.py --help` lists every option (sensitivity, working resolution, output
 folder, flat export, …).
@@ -158,7 +166,9 @@ folder, flat export, …).
    that physical size, so an identity card is cropped precisely - no guessing
    where its edges are. These controls stay available even before a PDF is opened.
 6. **Export All** exports every approved document of every loaded PDF. Each PDF
-   gets its own sub-folder.
+   gets its own sub-folder. Turn on *Blur faces in exported images* in the
+   Settings to redact the portrait photo of every card while exporting (see
+   [§6](#6-settings) - the detector it uses is shown right below the option).
 
 The status bar shows pages, detected and approved documents, the current activity
 and a cancel button for long running work. After detection it also reports which
@@ -184,6 +194,7 @@ files. It lives next to the settings in your user profile.
 | `←` `→` `↑` `↓` | Move the selected crop by 1 px (in *Adjust crop…* and on the page view) |
 | `Shift` + arrows | Resize the crop: `→`/`←` wider/narrower, `↑`/`↓` taller/shorter (1 px per side) |
 | `Ctrl` + arrows | Same, but 10 px per press (`Alt` = 20 px) |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo in *Adjust crop…* (crop, rotation, type, identifier, include) |
 
 ### Output files
 
@@ -339,7 +350,7 @@ Full guide: [docs/OCR_SETUP.md](docs/OCR_SETUP.md).
 
 ## 6. Settings
 
-Stored in the user profile (`%APPDATA%\DocumentCardExtractor\settings.json`, or
+Stored in the user profile (`%LOCALAPPDATA%\DocumentCardExtractor\settings.json`, or
 `~/.config/DocumentCardExtractor/settings.json` on Linux) and editable on the
 Settings page.
 
@@ -368,7 +379,29 @@ Settings page.
 | Separate sub-folder per PDF | on | `output/<pdf name>/` |
 | Filename format | `{type}_{identifier}_{page}_{sequence}` | see above |
 | Open output folder after export | on | Explorer opens when done |
+| Blur faces in exported images | off | privacy redaction of the portrait photo (YuNet on OpenCV 5, Haar cascade on OpenCV 4) |
+| Blur kernel | 51 px | strength of the blur (odd number, larger = stronger) |
+| Min face size | 40 px | smallest face detected at the 300 dpi baseline, scaled with the render DPI |
 | Document types | 9 built-in | add your own on the Settings page (name + optional OCR keywords) |
+
+#### Face blur (privacy)
+
+The export can blur the face on every exported card. The line under the option
+always shows which detector is active:
+
+| Detector | Used when | Model |
+| --- | --- | --- |
+| **YuNet** (`cv2.FaceDetectorYN`) | OpenCV 4.5.4+ **and** 5.x | `assets/models/face_detection_yunet_2023mar.onnx` (227 KB, ships with the app) |
+| **Haar cascade** (`cv2.CascadeClassifier`) | OpenCV 4 only | built into OpenCV |
+
+OpenCV 5 removed `cv2.CascadeClassifier`, which is why the neural detector is
+preferred. The model is looked up in this order: `$DCE_FACE_MODEL` →
+`%LOCALAPPDATA%\DocumentCardExtractor\models\` → `assets/models/` → `models/`.
+When no model is found, a **Download model…** button appears next to the option
+and fetches it once (227 KB - the only network access in the application);
+afterwards the application is offline again. If blurring is requested but cannot
+run, the export still writes every image and reports what was skipped - a
+missing detector never fails the whole run.
 
 ---
 
@@ -405,7 +438,10 @@ core/
   orientation_detector.py   word-shape heuristic + optional OCR refinement
   document_classifier.py    keyword/geometry classification, identifier extraction
   ocr_engine.py             optional Tesseract / EasyOCR backend
-  image_exporter.py         filenames, DPI aware saving (JPG/PNG/TIFF)
+  face_detector.py          optional face detection for the privacy blur
+                            (YuNet on OpenCV 5, Haar cascade on OpenCV 4)
+  page_range.py             tolerant "1,3,5-7" page range parser (GUI + CLI)
+  image_exporter.py         filenames, DPI aware saving (JPG/PNG/TIFF), face blur
   models.py                 DocumentType, DetectedCard, quad helpers
 
 workers/
@@ -433,6 +469,7 @@ tests/
   test_gui.py               end-to-end GUI test (offscreen)
 
 assets/icons/               note about the vector icons
+assets/models/              YuNet face model for the privacy blur (+ its licence note)
 output/                     default export folder
 ```
 
@@ -459,6 +496,16 @@ page inside a batch, export permission problems and per-file export errors.
 Detection warnings are shown after the run and successful files are still
 exported. Settings and history are written atomically and both survive a crash.
 
+Two "soft" failures are reported without stopping anything:
+
+* **Face blur unavailable** - if the requested privacy blur cannot run (no
+  detector/model on this build), every image is still exported and the result
+  dialog lists what was skipped, so unblurred files are never handed over
+  silently.
+* **Malformed page range** - `cli.py --pages 1,x` prints a usage error and exits
+  with code 2 instead of raising a `ValueError`; the GUI simply ignores the
+  unparsable parts.
+
 ---
 
 ## 9. Tests
@@ -477,14 +524,18 @@ python -m pytest tests -q
   resize/expand along the quad's own axes, IoU, filenames, model serialisation,
   classification, orientation, image/PDF loading (multi-page TIFF, unsupported and
   broken files), settings/history persistence (atomic writes, corrupt-file
-  recovery), document type registration.
+  recovery), document type registration, page-range parsing (incl. typos),
+  face-detector backend selection and the model download validation.
 * `tests/test_workers.py` – the detection/export worker threads run synchronously:
   file sequence numbering, cancellation, per-page error reporting, GUI edit
-  snapshots (settings and cards are frozen when the threads start).
+  snapshots (settings and cards are frozen when the threads start) and the
+  "face blur skipped" warning being reported exactly once.
 * `tests/test_gui.py` – offscreen `MainWindow` test: open PDF **and image** →
   detect → edit (handles, drag to move, keyboard nudge/resize, margin, fine
   rotation, Add Region with a fixed card size) → export → history entry, plus the
-  crop editor, the settings page and the document type manager.
+  crop editor (incl. Ctrl+Z/Ctrl+Y and single-step identifier undo), the settings
+  page (full form round-trip, export presets, face-blur availability), the gallery
+  filters and the document type manager.
 
 ---
 
@@ -514,6 +565,10 @@ sample-scan tests automatically when it is missing. If you want to ship a
 sanitised sample, force-add it (`git add -f sample.pdf`) or put it under
 `docs/` (that folder is whitelisted).
 
+**Committed on purpose:** `assets/models/face_detection_yunet_2023mar.onnx`
+(227 KB, Apache-2.0). It makes the privacy face blur work on a fresh clone with
+no download; `assets/models/README.md` records its source and licence.
+
 ```bat
 git add -A
 git commit -m "Document Card Extractor"
@@ -525,9 +580,10 @@ git push -u origin main
 `user.name` / `user.email`; only `git remote add` + `git push` remain for
 publishing.)
 
-Also ignored: `output/`, `_debug/`, scratch files, `__pycache__/`, `.pytest_cache/`,
-virtual environments, IDE folders and `settings.json` / `history.json` (they live
-in your user profile anyway).
+Also ignored: `output/`, `_debug/`, scratch files (`_*.txt`, `_*.py`, `_*/`),
+`__pycache__/`, `.pytest_cache/`, virtual environments, IDE folders,
+`settings.json` / `history.json` (they live in your user profile anyway) and
+internal notes such as `CODE_REVIEW.md`.
 
 ---
 
@@ -543,6 +599,9 @@ in your user profile anyway).
   remove that region and add both cards manually.
 * Always check the amber *"Check orientation"* hint before exporting - a 180° flip
   cannot be detected without OCR.
+* Sharing scans of personal IDs? Switch on *Blur faces in exported images* in the
+  Settings: the portrait photo of every exported card is blurred, and the status
+  line under the option tells you which detector will do it.
 
 
 

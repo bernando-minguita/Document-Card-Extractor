@@ -44,6 +44,7 @@ history.json
 
 # scratch files and folders created while debugging
 _*.txt
+_*.py
 _*/
 
 # ------------------------------------------------------------ documents
@@ -66,3 +67,8 @@ desktop.ini
 
 # ------------------------------------------------------------- packaging
 *.spec
+
+# --------------------------------------------------------- bundled model files
+# The YuNet face model is part of the application so a fresh clone can blur
+# faces offline (see assets/models/README.md). Never ignore it.
+!assets/models/*.onnx

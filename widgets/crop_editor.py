@@ -8,7 +8,7 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QUndoStack, QUndoCommand
+from PySide6.QtGui import QKeySequence, QUndoCommand, QUndoStack, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -74,6 +74,7 @@ class CropEditorDialog(QDialog):
         card: DetectedCard,
         parent: Optional[QWidget] = None,
         password: str = "",
+        render_dpi: int = 300,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Adjust document · page {card.page_number}")
@@ -81,6 +82,9 @@ class CropEditorDialog(QDialog):
         self.setMinimumSize(900, 620)
         self._pdf_path = Path(pdf_path)
         self._password = password or ""  # for encrypted PDFs (in memory only)
+        # The size estimate in the preview line must match what the export uses
+        # ("Export / detection DPI" in the settings), not a fixed 300 dpi.
+        self._render_dpi = max(1, int(render_dpi or 300))
         self._draft = card.copy_card()
         self._reset_source = card.copy_card()
         self._page_image: Optional[np.ndarray] = None
@@ -89,6 +93,9 @@ class CropEditorDialog(QDialog):
         # Undo/redo stack
         self._undo_stack = QUndoStack(self)
         self._suppress_undo = False
+        # State captured before the first keystroke in the Identifier field, so
+        # the whole edit becomes a single undo step.
+        self._identifier_base: Optional["_CardState"] = None
         # Rendering the cropped preview is expensive (full-page perspective
         # warp + a 1000 px thumbnail).  During a live rotation drag or while
         # nudging with the arrow keys it fires per mouse-move, so rebuilds are
@@ -100,8 +107,40 @@ class CropEditorDialog(QDialog):
         self._preview_pending = False
         self._load_page()
         self._build_ui()
+        self._create_shortcuts()
         apply_icon_size(self)
         self._refresh()
+
+    def _create_shortcuts(self) -> None:
+        """Ctrl+Z / Ctrl+Y (the tooltips promise them, the buttons were the only way)."""
+        self._undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self, self._undo_triggered)
+        self._redo_shortcut = QShortcut(QKeySequence.StandardKey.Redo, self, self._redo_triggered)
+        # Ctrl+Shift+Z is the usual second binding for redo on Linux/Windows.
+        self._redo_alt_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self._redo_triggered)
+
+    @staticmethod
+    def _focused_text_field() -> Optional[QLineEdit]:
+        from PySide6.QtWidgets import QApplication
+
+        focus = QApplication.focusWidget()
+        return focus if isinstance(focus, QLineEdit) else None
+
+    def _undo_triggered(self) -> None:
+        field = self._focused_text_field()
+        if field is not None:
+            # inside the identifier field Ctrl+Z keeps its normal meaning
+            field.undo()
+            return
+        self._commit_identifier_undo()
+        self._undo_stack.undo()
+
+    def _redo_triggered(self) -> None:
+        field = self._focused_text_field()
+        if field is not None:
+            field.redo()
+            return
+        self._undo_stack.redo()
+
 
     # -------------------------------------------------------------------- setup
     def _load_page(self) -> None:
@@ -131,6 +170,8 @@ class CropEditorDialog(QDialog):
     def _apply_state(self, state: _CardState) -> None:
         """Apply a card state without pushing to undo stack."""
         self._suppress_undo = True
+        # an undo/redo cancels a half-finished identifier edit
+        self._identifier_base = None
         try:
             self._draft.quad_norm = state.quad_norm.copy()
             self._draft.rotation = state.rotation
@@ -344,6 +385,7 @@ class CropEditorDialog(QDialog):
         self._identifier_edit = QLineEdit(self._draft.identifier)
         self._identifier_edit.setPlaceholderText("Optional, used in the filename")
         self._identifier_edit.textChanged.connect(self._on_identifier_changed)
+        self._identifier_edit.editingFinished.connect(self._on_identifier_edited)
         id_row.addWidget(self._identifier_edit, 1)
         side_layout.addLayout(id_row)
 
@@ -447,15 +489,17 @@ class CropEditorDialog(QDialog):
         preview = make_thumbnail(cropped, 1000)
         self._preview.set_source(bgr_to_pixmap(preview))
         source_height, source_width = preview.shape[:2]
-        export_scale = max(1.0, 300.0 / float(self.PREVIEW_DPI))
+        export_scale = max(1.0, float(self._render_dpi) / float(self.PREVIEW_DPI))
         rotation_text = f"{self._draft.rotation}°"
         if abs(self._draft.fine_rotation) >= 0.05:
             rotation_text += f" + {self._draft.fine_rotation:.1f}°"
         self._preview_info.setText(
             f"{self._draft.doc_type.display_name} · "
-            f"{int(source_width * export_scale)} × {int(source_height * export_scale)} px at 300 dpi · "
+            f"{int(source_width * export_scale)} × {int(source_height * export_scale)} px "
+            f"at {self._render_dpi} dpi · "
             f"rotation {rotation_text}"
         )
+
 
     def _schedule_preview(self) -> None:
         """Rebuild the preview soon, at most ~30 times per second.
@@ -563,9 +607,21 @@ class CropEditorDialog(QDialog):
         if self._suppress_undo:
             self._draft.identifier = text.strip()
             return
-        old = self._current_state()
+        if self._identifier_base is None:
+            # Snapshot before the first keystroke: one undo step per edit, not
+            # one per character.
+            self._identifier_base = self._current_state()
         self._draft.identifier = text.strip()
-        self._push_state("Edit identifier", old)
+
+    def _commit_identifier_undo(self) -> None:
+        """Turn a finished identifier edit into a single undo command."""
+        base, self._identifier_base = self._identifier_base, None
+        if base is not None:
+            self._push_state("Edit identifier", base)
+
+    def _on_identifier_edited(self) -> None:
+        """``editingFinished``: the user left the field (or pressed Enter)."""
+        self._commit_identifier_undo()
 
     def _on_include_toggled(self, checked: bool) -> None:
         if self._suppress_undo:
@@ -577,6 +633,9 @@ class CropEditorDialog(QDialog):
 
     def _reset(self) -> None:
         self._draft = self._reset_source.copy_card()
+        # "Reset" means "start over": the edits it discards must not stay
+        # reachable through Undo.
+        self._identifier_base = None
+        self._undo_stack.clear()
         self._refresh()
-
 

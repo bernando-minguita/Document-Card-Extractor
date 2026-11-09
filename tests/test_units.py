@@ -39,11 +39,69 @@ def test_order_quad_points_keeps_rotation():
     assert np.allclose(ordered.sum(axis=0), rotated.sum(axis=0))
 
 
-def test_expand_quad_grows_outwards():
-    quad = _quad(100, 100, 300, 200)
-    grown = expand_quad(quad, 0.05)
-    assert grown[:, 0].min() < 100 and grown[:, 0].max() > 300
-    assert grown[:, 1].min() < 100 and grown[:, 1].max() > 200
+def test_expand_quad_pads_every_side_by_the_same_amount():
+    """Regression: the diagonal cancelled out, so a wide card lost top/bottom padding."""
+    quad = _quad(100, 100, 500, 200)  # 400 x 100 px, diagonal ~412.3
+    diagonal = float(np.hypot(400.0, 100.0))
+    expected = 0.02 * diagonal
+    grown = expand_quad(quad, 0.02)
+    assert 100.0 - float(grown[:, 0].min()) == pytest.approx(expected, rel=0.02)
+    assert float(grown[:, 0].max()) - 500.0 == pytest.approx(expected, rel=0.02)
+    assert 100.0 - float(grown[:, 1].min()) == pytest.approx(expected, rel=0.02)
+    assert float(grown[:, 1].max()) - 200.0 == pytest.approx(expected, rel=0.02)
+
+
+def test_page_range_parser_accepts_ranges_and_reports_typos():
+    from core.page_range import parse_page_range
+
+    assert parse_page_range("1,3,5-7", 10) == ([0, 2, 4, 5, 6], [])
+    assert parse_page_range("", 3) == ([0, 1, 2], [])
+    assert parse_page_range("0-2", 5) == ([0, 1], [])  # clamped to page 1
+    assert parse_page_range("4-99", 5) == ([3, 4], [])  # clamped to page 5
+    assert parse_page_range("1,x", 5) == ([0], ["x"])  # typo reported, rest kept
+    assert parse_page_range("7-5", 5) == ([], ["7-5"])  # reversed range
+    assert parse_page_range("1,x") == ([0], ["x"])  # validated before any file
+
+
+def test_cli_reports_a_malformed_page_range_instead_of_crashing(sample_pdf, capsys):
+    """Regression: ``--pages 1,x`` raised ValueError from int()."""
+    import cli
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([str(sample_pdf), "--pages", "1,x"])
+    assert excinfo.value.code == 2  # argparse usage error
+    message = capsys.readouterr().err
+    assert "--pages" in message and "x" in message
+
+
+def test_cli_accepts_the_tif_extension():
+    """The exporter writes .tif, so the command line must offer it too."""
+    import cli
+
+    assert cli.build_parser().parse_args(["scan.pdf", "--format", "tif"]).format == "tif"
+
+
+def test_faint_text_meets_the_wcag_contrast_ratio():
+    from app import styles
+
+    def luminance(colour: str) -> float:
+        channels = [int(colour[index : index + 2], 16) / 255.0 for index in (1, 3, 5)]
+
+        def linear(value: float) -> float:
+            return value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+
+        red, green, blue = (linear(value) for value in channels)
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    def ratio(foreground: str, background: str) -> float:
+        lighter = max(luminance(foreground), luminance(background))
+        darker = min(luminance(foreground), luminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+
+    for background in (styles.SURFACE, styles.SURFACE_ALT, styles.BACKGROUND):
+        for colour in (styles.TEXT, styles.TEXT_MUTED, styles.TEXT_FAINT):
+            assert ratio(colour, background) >= 4.5, f"{colour} on {background} is too faint"
+
 
 
 def test_quad_size_and_iou():
@@ -113,8 +171,158 @@ def test_export_writes_real_images(sample_pdf, tmp_path):
         assert image.shape[0] > 50 and image.shape[1] > 50
 
 
+def test_face_detector_reports_no_backend_without_cascade_or_yunet(monkeypatch):
+    """A build with neither detector must report why, and the blur is a no-op."""
+    from types import SimpleNamespace
+
+    from core import face_detector, image_exporter
+
+    monkeypatch.setattr(face_detector, "cv2", SimpleNamespace(__version__="5.0.0"))
+    monkeypatch.setattr(face_detector, "find_model", lambda: None)
+    monkeypatch.setattr(face_detector, "_status_cache", None)
+
+    backend, message = face_detector.status()
+    assert backend == ""
+    assert "5.0.0" in message
+    assert face_detector.is_available() is False
+
+    image = np.full((16, 16, 3), 200, dtype=np.uint8)
+    original = image.copy()
+    assert face_detector.detect_faces(image) == []
+    assert np.array_equal(image_exporter.blur_faces(image), original)
+
+
+def test_face_detector_prefers_yunet_when_the_model_is_present(monkeypatch, tmp_path):
+    """OpenCV 5 path: the YuNet network is used once its ONNX model exists."""
+    from core import face_detector
+
+    model = tmp_path / face_detector.MODEL_FILENAME
+    model.write_bytes(b"x" * (face_detector.MIN_MODEL_BYTES + 1))
+    monkeypatch.setattr(face_detector, "model_candidates", lambda: [model])
+    monkeypatch.setattr(face_detector, "_status_cache", None)
+
+    backend, message = face_detector.status()
+    assert backend == "yunet"
+    assert face_detector.MODEL_FILENAME in message
+
+    class _FakeDetector:
+        def __init__(self) -> None:
+            self.size = None
+
+        def setInputSize(self, size):  # noqa: N802 - OpenCV naming
+            self.size = size
+
+        def detect(self, image):
+            # x, y, w, h, 5 landmarks, score - the YuNet row layout
+            faces = np.array(
+                [
+                    [10, 10, 40, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.9],
+                    [2, 2, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.9],
+                ],
+                dtype=np.float32,
+            )
+            return len(faces), faces
+
+    fake = _FakeDetector()
+    monkeypatch.setattr(face_detector, "_get_detector", lambda: ("yunet", fake))
+
+    image = np.zeros((60, 80, 3), dtype=np.uint8)
+    boxes = face_detector.detect_faces(image, min_face_size=20)
+    assert boxes == [(10, 10, 40, 40)], "tiny detections must be filtered out"
+    assert fake.size == (80, 60), "the detector must be told the real image size"
+
+
+def test_face_detector_finds_the_bundled_model(tmp_path, monkeypatch):
+    """A clone (and a PyInstaller build) must find the shipped model offline."""
+    import sys
+    from pathlib import Path
+
+    from core import face_detector
+
+    bundled = (
+        Path(face_detector.__file__).resolve().parents[1]
+        / "assets"
+        / "models"
+        / face_detector.MODEL_FILENAME
+    )
+    assert any(Path(item) == bundled for item in face_detector.model_candidates())
+    if bundled.is_file():
+        assert face_detector.find_model() is not None
+
+    # frozen layout: PyInstaller unpacks the payload into sys._MEIPASS
+    payload = tmp_path / "frozen" / "assets" / "models" / face_detector.MODEL_FILENAME
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"x" * (face_detector.MIN_MODEL_BYTES + 1))
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "frozen"), raising=False)
+    monkeypatch.setattr(face_detector, "model_folder", lambda: tmp_path / "empty")
+    assert face_detector.find_model() == payload
+
+
+def test_download_face_model_validates_and_stores_the_payload(tmp_path):
+    from core import face_detector
+
+    target = tmp_path / "models" / face_detector.MODEL_FILENAME
+    payload = b"\x00" * (face_detector.MIN_MODEL_BYTES + 5)
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return payload
+
+    written = face_detector.download_model(target, opener=lambda *a, **k: _Response())
+    assert written == target and target.stat().st_size == len(payload)
+
+    # an error page instead of the model must be rejected, not stored
+    broken = tmp_path / "broken" / face_detector.MODEL_FILENAME
+
+    class _ErrorResponse(_Response):
+        def read(self):
+            return b"<html>404</html>"
+
+    with pytest.raises(RuntimeError):
+        face_detector.download_model(broken, opener=lambda *a, **k: _ErrorResponse())
+    assert not broken.exists()
+    assert not list((tmp_path / "broken").glob("*.part"))
+
+
+
+def test_export_skips_face_blur_when_the_cascade_is_missing(sample_pdf, tmp_path, monkeypatch):
+    """Regression: an unavailable cascade aborted every file ("0 exported")."""
+    from core import image_exporter
+    from core.pdf_loader import PdfDocument
+
+    reason = "face blur needs OpenCV's Haar cascade, which this build does not have"
+    monkeypatch.setattr(image_exporter, "face_blur_support", lambda: (False, reason))
+
+    def _must_not_run(*_args, **_kwargs):  # pragma: no cover - proof it is skipped
+        raise AssertionError("blur_faces must not be called without a cascade")
+
+    monkeypatch.setattr(image_exporter, "blur_faces", _must_not_run)
+
+    card = DetectedCard(page_index=0, quad_norm=_quad(0.1, 0.6, 0.3, 0.8))
+    with PdfDocument(sample_pdf) as document:
+        options = ExportOptions(
+            output_dir=str(tmp_path),
+            image_format="png",
+            render_dpi=150,
+            blur_faces=True,
+        )
+        summary = image_exporter.ImageExporter(options).export_cards(document, [card], tmp_path)
+
+    assert summary.errors == []
+    assert summary.success_count == 1, "the export must still write the image"
+    assert [item.path.name for item in summary.files if item.ok]
+    assert summary.warnings == [reason]
+
+
 def test_suggest_output_dir_creates_subfolder(tmp_path):
     folder = suggest_output_dir("C:/scans/trip 2026.pdf", str(tmp_path), True)
+
     assert folder.parent == tmp_path
     assert folder.name == "trip_2026"
     assert suggest_output_dir(None, str(tmp_path), True) == tmp_path

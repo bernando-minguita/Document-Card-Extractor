@@ -11,9 +11,11 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from . import face_detector
 from .models import DetectedCard, DocumentType
 from .pdf_loader import PdfDocument
 from .perspective_corrector import rotate_image, warp_quad
+
 
 SUPPORTED_FORMATS = {
     "jpg": ".jpg",
@@ -27,39 +29,36 @@ _ILLEGAL_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 # ------------------------------------------------------------------ face blur
-_FACE_CASCADE = None
+def face_blur_support() -> tuple:
+    """Return ``(available, reason)`` for the export-time face blur.
 
-
-def _get_face_cascade():
-    """Load OpenCV's built-in Haar cascade for frontal faces."""
-    global _FACE_CASCADE
-    if _FACE_CASCADE is None:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        _FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
-        if _FACE_CASCADE.empty():
-            raise RuntimeError(f"Failed to load face cascade from {cascade_path}")
-    return _FACE_CASCADE
+    The detection itself lives in :mod:`core.face_detector` (YuNet neural network
+    on OpenCV 5, Haar cascade on OpenCV 4).  This wrapper keeps the exporter's
+    public API and gives the settings page and the export summary one place to
+    ask.
+    """
+    backend, message = face_detector.status()
+    return bool(backend), ("" if backend else message)
 
 
 def blur_faces(image: np.ndarray, blur_kernel: int = 51, min_face_size: int = 40) -> np.ndarray:
-    """Detect and blur faces in *image* (BGR). Returns a copy with faces blurred."""
+    """Detect and blur faces in *image* (BGR). Returns a copy with faces blurred.
+
+    Without a usable detector the image is returned unchanged (see
+    :func:`face_blur_support`); the caller reports that to the user.
+    """
     if image is None or image.size == 0:
         return image
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    cascade = _get_face_cascade()
-    faces = cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(min_face_size, min_face_size),
-        flags=cv2.CASCADE_SCALE_IMAGE,
-    )
-    if len(faces) == 0:
+    if not face_detector.is_available():
+        return image
+    faces = face_detector.detect_faces(image, min_face_size)
+    if not faces:
         return image
     result = image.copy()
     k = max(3, blur_kernel | 1)  # ensure odd
     for (x, y, w, h) in faces:
         roi = result[y:y+h, x:x+w]
+
         if roi.size == 0:
             continue
         blurred = cv2.GaussianBlur(roi, (k, k), 0)
@@ -126,6 +125,9 @@ class ExportSummary:
     output_dir: Path
     files: List[ExportedFile] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    #: Non fatal problems (e.g. face blur unavailable) - shown to the user but
+    #: they do not turn a successful export into a failed one.
+    warnings: List[str] = field(default_factory=list)
 
     @property
     def success_count(self) -> int:
@@ -266,9 +268,18 @@ class ImageExporter:
                     # it with the actual render resolution, otherwise a
                     # sub-300 dpi export hunts face boxes that are larger than
                     # the whole (small) image.
-                    dpi = document.effective_dpi(card.page_index, self.options.render_dpi)
-                    min_face = max(16, int(round(self.options.min_face_size * dpi / 300.0)))
-                    image = blur_faces(image, self.options.face_blur_kernel, min_face)
+                    available, reason = face_blur_support()
+                    if not available:
+                        # Never fail the export because privacy blurring is
+                        # unavailable - but say so once, loudly, instead of
+                        # shipping unblurred images without a word.
+                        if reason not in summary.warnings:
+                            summary.warnings.append(reason)
+                    else:
+                        dpi = document.effective_dpi(card.page_index, self.options.render_dpi)
+                        min_face = max(16, int(round(self.options.min_face_size * dpi / 300.0)))
+                        image = blur_faces(image, self.options.face_blur_kernel, min_face)
+
                 stem = self.build_filename(card, sequence, document.stem, identifier_fallback)
                 path = self.unique_path(output_dir, stem, used)
                 self.save_image(image, path, self.options.render_dpi)

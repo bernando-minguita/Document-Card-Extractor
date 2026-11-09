@@ -60,20 +60,23 @@ def rotate_quad(quad: np.ndarray, degrees: float, center: Optional[Sequence[floa
 
 
 def expand_quad(quad: np.ndarray, ratio: float = 0.01) -> np.ndarray:
-    """Grow *quad* around its centroid by *ratio* of its diagonal.
+    """Grow *quad* so every side moves outwards by *ratio* of its diagonal.
 
     A small outward padding guarantees that the physical document edge (which is
-    a few pixels wide and often slightly darker/rounded) is never cut off.
+    a few pixels wide and often slightly darker/rounded) is never cut off.  The
+    offset is measured perpendicular to each side (miter joins at the corners),
+    so a portrait card gets the same padding on its long and short sides instead
+    of a percentage of each side length.
     """
     quad = np.asarray(quad, dtype=np.float32).reshape(4, 2)
     if ratio <= 0:
         return quad.copy()
-    center = quad.mean(axis=0)
     diagonal = float(np.linalg.norm(quad[0] - quad[2]))
     if diagonal <= 1e-6:
         return quad.copy()
-    scale = 1.0 + (2.0 * ratio * diagonal) / diagonal
-    return ((quad - center) * scale + center).astype(np.float32)
+    distance = float(ratio) * diagonal
+    return offset_quad(quad, distance, distance)
+
 
 
 def quad_frame(quad: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -108,6 +108,13 @@ class MainWindow(QMainWindow):
         self._thumb_timer.setInterval(30)
         self._thumb_timer.timeout.connect(self._flush_thumbnails)
         self._thumb_pending: Optional[DetectedCard] = None
+        # The gallery is rebuilt when a page finishes; a 20 page run would
+        # rebuild it 20 times, so those refreshes are coalesced as well.
+        self._gallery_timer = QTimer(self)
+        self._gallery_timer.setSingleShot(True)
+        self._gallery_timer.setInterval(120)
+        self._gallery_timer.timeout.connect(self._refresh_gallery)
+
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setWindowIcon(app_icon())
@@ -196,15 +203,26 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        engine = OcrEngine.describe_availability()
-        ocr_label = QLabel(f"OCR engine: {engine or 'not installed'}")
-        ocr_label.setObjectName("Faint")
-        ocr_label.setWordWrap(True)
-        layout.addWidget(ocr_label)
+        self._ocr_status_label = QLabel(self._ocr_status_text())
+        self._ocr_status_label.setObjectName("Faint")
+        self._ocr_status_label.setWordWrap(True)
+        layout.addWidget(self._ocr_status_label)
         version = QLabel(f"Version {APP_VERSION} · offline")
         version.setObjectName("Faint")
         layout.addWidget(version)
         return sidebar
+
+    @staticmethod
+    def _ocr_status_text() -> str:
+        engine = OcrEngine.describe_availability()
+        return f"OCR engine: {engine or 'not installed'}"
+
+    def _update_ocr_status_label(self) -> None:
+        """Refresh the sidebar line (it was computed once at startup)."""
+        label = getattr(self, "_ocr_status_label", None)
+        if label is not None:
+            label.setText(self._ocr_status_text())
+
 
     def _build_status_bar(self) -> None:
         status = self.statusBar()
@@ -867,8 +885,10 @@ class MainWindow(QMainWindow):
         self._gallery_page_filter.addItem("All pages", None)
         if session:
             for p in range(session.page_count):
-                self._gallery_page_filter.addItem(f"Page {p+1:02d}", p)
+                # page_number is 1-based, so the filter value must be too
+                self._gallery_page_filter.addItem(f"Page {p+1:02d}", p + 1)
         self._gallery_page_filter.blockSignals(False)
+
 
         self._show_current_page()
         self._refresh_gallery()
@@ -968,10 +988,17 @@ class MainWindow(QMainWindow):
         if type_data is not None:
             type_filter = DocumentType.from_value(type_data)
 
+        # "This page" follows the page shown in the viewer; "All pages" either
+        # shows everything or narrows to the page picked in the page combo.
+        current_page_only = self._gallery_filter.currentData() == "page"
+        self._gallery_page_filter.setEnabled(not current_page_only)
         page_filter = None
-        page_data = self._gallery_page_filter.currentData()
-        if page_data is not None:
-            page_filter = int(page_data)
+        if current_page_only and self.session is not None:
+            page_filter = self._page_index + 1
+        else:
+            page_data = self._gallery_page_filter.currentData()
+            if page_data is not None:
+                page_filter = int(page_data)
 
         gallery_filter = GalleryFilter(
             text=self._gallery_search.text(),
@@ -980,11 +1007,21 @@ class MainWindow(QMainWindow):
             included_only=self._gallery_included_only.isChecked(),
             orientation_confident_only=self._gallery_confident_only.isChecked(),
         )
-        self._gallery.set_filter(gallery_filter, self._selected_card_id)
-        self._gallery.set_cards(self._visible_cards(), self._selected_card_id)
+        # One entry point: set_filter() + set_cards() rebuilt the list twice.
+        self._gallery.set_cards(cards, self._selected_card_id, gallery_filter)
 
         self._gallery_count.setText(f"({self._gallery.count()})")
         self._sync_card_controls()
+
+    def _schedule_gallery_refresh(self) -> None:
+        """Refresh the gallery soon, at most once per burst of page updates.
+
+        A detection run finishes one page after another; rebuilding the whole
+        list (and its thumbnail cache) for every page made long documents janky.
+        """
+        if not self._gallery_timer.isActive():
+            self._gallery_timer.start()
+
 
     def _sync_card_controls(self) -> None:
         card = self._selected_card() if self.session else None
@@ -1127,7 +1164,6 @@ class MainWindow(QMainWindow):
                 return
 
         for page_index in pages:
-            session.clear_page(page_index)
             session.detected_pages.discard(page_index)
 
         self._detection_errors: List[str] = []
@@ -1138,7 +1174,9 @@ class MainWindow(QMainWindow):
         self._progress.start("Starting detection…")
 
         worker = DetectionWorker(session.path, pages, self.settings, password=session.password, parent=self)
+        worker.page_started.connect(self._on_page_started)
         worker.progress.connect(self._on_detection_progress)
+
         worker.card_found.connect(self._on_card_found)
         worker.page_finished.connect(self._on_page_finished)
         worker.failed.connect(self._on_detection_failed)
@@ -1160,29 +1198,24 @@ class MainWindow(QMainWindow):
         if session is not None:
             session.add_card(card)
 
+    def _on_page_started(self, page_index: int) -> None:
+        """Drop the old cards of a page once the worker really started on it.
+
+        Clearing every page up front threw away good results when the file had
+        moved, been renamed or needed a password: the worker opens the document
+        before it emits ``page_started``, so this only happens on a real run.
+        """
+        session = self.session
+        if session is None:
+            return
+        session.clear_page(page_index)
+        self._schedule_gallery_refresh()
+
     def _parse_page_range(self, text: str, page_count: int) -> List[int]:
-        """Parse ``"1,3,5-7"`` into zero-based page indices."""
-        result: List[int] = []
-        for chunk in text.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if "-" in chunk:
-                start, _, end = chunk.partition("-")
-                try:
-                    first = max(1, int(start))
-                    last = min(page_count, int(end))
-                except ValueError:
-                    continue
-                result.extend(range(first - 1, last))
-            else:
-                try:
-                    page = int(chunk)
-                except ValueError:
-                    continue
-                if 1 <= page <= page_count:
-                    result.append(page - 1)
-        return sorted(set(result))
+        """Parse ``"1,3,5-7"`` into zero-based page indices (bad parts ignored)."""
+        from core.page_range import parse_page_range
+
+        return parse_page_range(text, page_count)[0]
 
     def _on_page_finished(self, page_index: int, count: int) -> None:
         session = self.session
@@ -1190,7 +1223,9 @@ class MainWindow(QMainWindow):
             session.detected_pages.add(page_index)
         if page_index == self._page_index:
             self._refresh_overlays()
-            self._refresh_gallery()
+        # Coalesced: a multi-page run finishes page after page and every page
+        # would otherwise rebuild the whole gallery.
+        self._schedule_gallery_refresh()
         self._update_state()
 
     def _on_detection_failed(self, message: str) -> None:
@@ -1278,7 +1313,12 @@ class MainWindow(QMainWindow):
         options = self.settings.export_options()
         options.output_dir = folder
         options.create_subfolder = False
-        self._start_export([ExportJob(session.path, [card], password=session.password)], options)
+        # "Export it anyway?" must actually export: the job snapshot would
+        # otherwise be filtered out again by included_cards.
+        exportable = card.copy_card()
+        exportable.included = True
+        self._start_export([ExportJob(session.path, [exportable], password=session.password)], options)
+
 
     def _start_export(self, jobs: List[ExportJob], options: ExportOptions) -> None:
         self._active_export_jobs = jobs
@@ -1329,20 +1369,29 @@ class MainWindow(QMainWindow):
             page_count=len(
                 # Pages that actually contributed exported documents, not the
                 # number of documents (which document_count already holds).
-                {card.page_index for job in jobs for card in job.included_cards}
+                # The file is part of the key: page 2 of two PDFs is two pages.
+                {(str(job.pdf_path), card.page_index) for job in jobs for card in job.included_cards}
             ),
             files=[str(item.path) for item in summary.files if item.ok],
             errors=list(summary.errors) + list(getattr(self, "_export_errors", [])),
         )
-        if not self.history.add(entry):
+        if exported == 0 and cancelled:
+            # A cancelled run that wrote nothing is not a history event - it
+            # would only add a row with no files to the log.
+            self._progress.set_message("Export cancelled - nothing was written")
+        elif not self.history.add(entry):
             self._progress.set_message("The history file could not be written")
         self._refresh_history_table()
+
         self._refresh_dashboard()
 
         if exported and self.settings.open_output_after_export:
             self._open_folder(summary.output_dir)
 
         message = f"{exported} document image(s) exported to:\n{summary.output_dir}"
+        warnings = list(getattr(summary, "warnings", []))
+        if warnings:
+            message += "\n\nNote:\n" + "\n".join(f"• {item}" for item in warnings)
         if summary.failure_count:
             message += f"\n\n{summary.failure_count} file(s) failed."
             details = "\n".join(summary.errors[:6]) or "\n".join(getattr(self, "_export_errors", [])[:6])
@@ -1351,8 +1400,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export finished with errors", message)
         elif cancelled:
             QMessageBox.information(self, "Export cancelled", message)
+        elif warnings:
+            # the export worked, but a requested option was skipped - that must
+            # not look like a clean run
+            QMessageBox.warning(self, "Export finished with a note", message)
         else:
             QMessageBox.information(self, "Export finished", message)
+
 
     # -------------------------------------------------------- card operations
     def rotate_card(self, card_id: str, degrees: int) -> None:
@@ -1420,7 +1474,13 @@ class MainWindow(QMainWindow):
         card = session.find_card(card_id) if session else None
         if card is None or session is None:
             return
-        dialog = CropEditorDialog(session.path, card, parent=self, password=session.password)
+        dialog = CropEditorDialog(
+            session.path,
+            card,
+            parent=self,
+            password=session.password,
+            render_dpi=self.settings.render_dpi,
+        )
         if dialog.exec() != CropEditorDialog.DialogCode.Accepted:
             return
         edited = dialog.card

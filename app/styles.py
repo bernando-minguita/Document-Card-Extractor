@@ -9,8 +9,11 @@ SURFACE_ALT = "#f8fafc"
 BORDER = "#e2e8f0"
 BORDER_STRONG = "#cbd5e1"
 TEXT = "#0f172a"
-TEXT_MUTED = "#64748b"
-TEXT_FAINT = "#94a3b8"
+# Contrast (WCAG 2.1, on the lightest and the darkest light background):
+# TEXT 16.5:1, TEXT_MUTED 7.0:1, TEXT_FAINT 4.9:1.  TEXT_FAINT is used for
+# 12 px hints, so it must stay at or above the 4.5:1 AA limit everywhere.
+TEXT_MUTED = "#475569"
+TEXT_FAINT = "#5f6d81"
 PRIMARY = "#2563eb"
 PRIMARY_DARK = "#1d4ed8"
 PRIMARY_SOFT = "#dbeafe"

@@ -78,6 +78,9 @@ class ExportWorker(QThread):
                 )
                 summary.files.extend(job_summary.files)
                 summary.errors.extend(job_summary.errors)
+                for warning in job_summary.warnings:
+                    if warning not in summary.warnings:
+                        summary.warnings.append(warning)
                 sequence += job_summary.success_count
                 for item in job_summary.files:
                     if item.ok:

@@ -86,6 +86,27 @@ def test_export_worker_ignores_excluded_cards(synthetic_pdf, tmp_path, qapp):
     assert summary.success_count == 1
 
 
+def test_export_worker_reports_a_skipped_face_blur_once(synthetic_pdf, tmp_path, qapp, monkeypatch):
+    """An unavailable cascade must not fail the export, only warn (once per run)."""
+    from core import image_exporter
+
+    reason = "face blur needs OpenCV's Haar cascade"
+    monkeypatch.setattr(image_exporter, "face_blur_support", lambda: (False, reason))
+
+    collector: List[object] = []
+    worker = ExportWorker(
+        [ExportJob(synthetic_pdf, [_card(), _card()])],
+        ExportOptions(output_dir=str(tmp_path), image_format="png", blur_faces=True),
+    )
+    worker.finished_ok.connect(collector.append)
+    worker.run()
+
+    summary = collector[0]
+    assert summary.success_count == 2, "the images must still be written"
+    assert summary.errors == []
+    assert summary.warnings == [reason], "the skip must be reported exactly once"
+
+
 def test_export_worker_reports_a_broken_file_as_an_error(tmp_path, qapp):
     unsupported = tmp_path / "not_a_scan.pdf"
     unsupported.write_bytes(b"this is not a real pdf")

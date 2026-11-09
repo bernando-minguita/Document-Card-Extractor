@@ -7,7 +7,12 @@
 # tools that are not needed at runtime.
 PySide6-Essentials>=6.5
 
-# Image processing and document detection
+# Image processing and document detection.
+# Note: the optional "blur faces in exported images" feature uses OpenCV's Haar
+# cascade on OpenCV 4 and the YuNet neural network (cv2.FaceDetectorYN) on
+# OpenCV 5, using the model shipped in assets/models (or a one-time download from
+# the settings page).  Without a model the export still runs; it only reports
+# that the blurring was skipped.
 opencv-python-headless>=4.8        # opencv-python works as well
 numpy>=1.24
 
